@@ -12,6 +12,8 @@ categories.workspace = true
 
 [dependencies]
 ai-core = { path = "../ai-core" }
+ai-types = { path = "../ai-types" }
+ai-models = { path = "../ai-models" }
 ai-errors = { path = "../ai-errors" }
 ai-security = { path = "../ai-security" }
 ai-runtime = { path = "../ai-runtime" }

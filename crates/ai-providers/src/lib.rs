@@ -1,18 +1,22 @@
 //! Provider adapters: real HTTP integrations with LLM APIs.
 //!
-//! Current state:
-//!
-//! - [`openai_compat`] — full OpenAI Chat Completions wire protocol adapter.
-//!   Serves `openai`, `openrouter`, `ollama`, and arbitrary OpenAI-compatible
-//!   gateways (e.g. the project gateway at `opencode.ai/zen/go/v1`).
-//!   Streaming, tool calling, structured output, vision input, embeddings
-//!   capability metadata, DeepSeek-style reasoning, cache-aware usage.
-//! - Anthropic and Google Gemini native adapters: **not yet implemented**
-//!   (documented limitation; their APIs differ from the OpenAI wire format).
-//!   See `ENGINEERING-SPEC.md` §40 for status.
+//! - [`openai_compat`] — full OpenAI Chat Completions wire protocol adapter
+//!   (`openai`, `openrouter`, `ollama`, arbitrary OpenAI-compatible
+//!   gateways). Streaming, tool calling, structured output, vision,
+//!   DeepSeek-style reasoning, cache-aware usage.
+//! - [`anthropic`] — native Anthropic Messages API adapter (`x-api-key` +
+//!   `anthropic-version`, tool use blocks, SSE streaming).
+//! - [`gemini`] — native Google Gemini generateContent adapter.
+//! - [`finetune`] — real OpenAI fine-tuning jobs API client.
 //!
 //! Nothing here is mocked: every adapter performs real HTTP requests.
+//! Anthropic/Gemini/fine-tuning require their own credentials; without
+//! them the adapters compile and are wire-tested, and integration tests
+//! are credential-gated (documented per ENGINEERING-SPEC §40).
 
+pub mod anthropic;
+pub mod finetune;
+pub mod gemini;
 pub mod http;
 pub mod openai_compat;
 
@@ -20,30 +24,53 @@ use std::sync::Arc;
 
 use ai_core::Provider;
 use ai_errors::{AiError, ConfigurationError};
+use anthropic::{AnthropicConfig, AnthropicProvider};
+use gemini::{GeminiConfig, GeminiProvider};
 use openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 
 /// Creates a provider adapter from its id and configuration.
 ///
-/// Provider ids currently supported (OpenAI-compatible wire protocol):
-/// `openai`, `openrouter`, `ollama`, and any custom id with an explicit
-/// `base_url` (used for OpenAI-compatible gateways).
+/// Native wire formats: `anthropic`, `google` (Gemini).
+/// OpenAI-compatible: `openai`, `openrouter`, `ollama`, and any custom id
+/// with an explicit `base_url` (e.g. the project gateway `opencode`).
 pub fn create_provider(
     id: &str,
     config: &ai_config::ProviderConfig,
 ) -> Result<Arc<dyn Provider>, AiError> {
-    let openai_compat_config = OpenAiCompatConfig::from_provider_config(id, config)?;
-    Ok(Arc::new(OpenAiCompatProvider::new(openai_compat_config)?))
+    match id {
+        "anthropic" => Ok(Arc::new(AnthropicProvider::new(
+            AnthropicConfig::from_provider_config(config)?,
+        )?)),
+        "google" => Ok(Arc::new(GeminiProvider::new(
+            GeminiConfig::from_provider_config(config)?,
+        )?)),
+        _ => {
+            let openai_compat_config = OpenAiCompatConfig::from_provider_config(id, config)?;
+            Ok(Arc::new(OpenAiCompatProvider::new(openai_compat_config)?))
+        }
+    }
 }
 
 /// Builds a provider from a raw id, api key, and base URL (programmatic
-/// configuration path).
+/// configuration path). Native ids route to their native adapters.
 pub fn create_provider_direct(
     id: impl Into<String>,
     api_key: impl Into<String>,
     base_url: impl Into<String>,
 ) -> Result<Arc<dyn Provider>, AiError> {
-    let config = OpenAiCompatConfig::new(id, api_key, base_url);
-    Ok(Arc::new(OpenAiCompatProvider::new(config)?))
+    let id = id.into();
+    match id.as_str() {
+        "anthropic" => Ok(Arc::new(AnthropicProvider::new(AnthropicConfig::new(
+            api_key.into(),
+        ))?)),
+        "google" => Ok(Arc::new(GeminiProvider::new(GeminiConfig::new(
+            api_key.into(),
+        ))?)),
+        _ => {
+            let config = OpenAiCompatConfig::new(id, api_key, base_url);
+            Ok(Arc::new(OpenAiCompatProvider::new(config)?))
+        }
+    }
 }
 
 /// Builds the AI SDK client from a [`ai_config::Config`], registering every
@@ -78,6 +105,17 @@ mod tests {
         };
         assert!(matches!(err, AiError::Configuration(_)));
         assert!(err.to_string().contains("OPENAI_API_KEY"), "{err}");
+    }
+
+    #[test]
+    fn native_providers_route_to_native_adapters() {
+        let anthropic_cfg = ai_config::ProviderConfig::new("sk-anthropic-test");
+        let provider = create_provider("anthropic", &anthropic_cfg).unwrap();
+        assert_eq!(provider.id(), "anthropic");
+
+        let google_cfg = ai_config::ProviderConfig::new("sk-google-test");
+        let provider = create_provider("google", &google_cfg).unwrap();
+        assert_eq!(provider.id(), "google");
     }
 
     #[test]

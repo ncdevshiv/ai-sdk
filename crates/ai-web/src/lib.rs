@@ -11,8 +11,8 @@ mod search;
 pub use crawler::{CrawlConfig, CrawlResult, Crawler, Page};
 pub use extract::{extract_links, extract_metadata, html_to_text};
 pub use research::{
-    ExtractRequest, FirecrawlBackend, MapRequest, NativeResearchBackend, ResearchBackend,
-    ScrapeRequest, SearchRequest,
+    ExtractRequest, FirecrawlBackend, LlmStructuredExtractor, MapRequest, NativeResearchBackend,
+    ResearchBackend, ScrapeRequest, SearchRequest, StructuredExtractor,
 };
 pub use robots::RobotsPolicy;
 pub use search::{DuckDuckGoSearch, SearchProvider, SearchResult};

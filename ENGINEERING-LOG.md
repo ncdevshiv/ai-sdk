@@ -364,3 +364,61 @@ re-run to confirm.
   documentation comments referencing the ADR-007 unit-test strategy
   (scripted models) remain, and the PII redaction "placeholder" feature.
 - `.env` verified gitignored; no secrets in the tree.
+
+---
+
+## 2026-08-10 — Session 4: Recommendations Completed + Zero-Fake Audit
+
+### Entry 16 — Recommendation 1: MCP dual-era (legacy initialize) support
+- **What:** `McpServer::enable_legacy()` — a request carrying modern
+  per-request `_meta` is served statelessly; an `initialize` request
+  selects the legacy (2025-11-25) dialect; notifications are skipped by
+  transports. `McpClient::with_legacy()` performs the real handshake
+  (initialize → `notifications/initialized` → requests without `_meta`,
+  results without `resultType`).
+- **Tests:** legacy handshake round-trip; modern + legacy clients coexist
+  on the same dual-era server. ✅ 16/16 protocol tests.
+
+### Entry 17 — Recommendation 2: Native Anthropic + Gemini adapters
+- **Anthropic** (`anthropic.rs`): real Messages API (`x-api-key` +
+  `anthropic-version: 2023-06-01`), system prompts, tool_use/tool_result
+  blocks, base64 images, SSE streaming (`content_block_start/delta`,
+  `message_start/delta`) with in-flight tool-call accumulation, cache-aware
+  usage. Wire-tested (serialization/parsing/SSE mapping). Requires
+  `ANTHROPIC_API_KEY` for live calls (documented).
+- **Gemini** (`gemini.rs`): real generateContent/streamGenerateContent
+  (`x-goog-api-key`), function declarations/functionCall/functionResponse,
+  inline images (URL images rejected explicitly — Gemini needs inline
+  data), SSE `alt=sse` streaming, model listing. Wire-tested. Requires
+  `GOOGLE_API_KEY` (documented).
+- `create_provider` routes `anthropic`/`google` to the native adapters.
+  ✅ 30/30 provider tests.
+
+### Entry 18 — Recommendation 3: Fine-tuning jobs API client
+- `finetune.rs`: real OpenAI fine-tuning client — `create_job`,
+  `list_jobs`, `get_job`, `cancel_job`, `list_events`, plus training-file
+  upload (`POST /files`). Wire-tested. Requires an OpenAI-compatible key
+  (documented). Closes the ENGINEERING-SPEC §3 fine-tuning gap.
+
+### Entry 19 — Partial removed: NativeResearchBackend::extract
+- **Before:** returned raw content + schema (partial, not extraction).
+- **Now:** `StructuredExtractor` trait + `LlmStructuredExtractor` (real
+  model-driven JSON extraction against the schema); the native backend
+  **fails fast** with a clear error when no extractor is configured.
+  ✅ 17/17 web tests (extractor parses model JSON, rejects non-JSON,
+  fail-fast).
+
+### Entry 20 — README + CI
+- README status badge updated (Verified) + CI badge; CI workflow
+  (`.github/workflows/ci.yml`): fmt --check, clippy -D warnings,
+  workspace tests, credential-gated live-gateway job (deepseek-v4-flash +
+  mimo-v2.5).
+
+### Entry 21 — Final zero-fake audit + validation
+- No-fake audit ✅: zero TODO/FIXME/unimplemented!/unreachable!/stub/
+  coming-soon/dummy markers in `crates/`; no mock/fake-named shipped code;
+  only documentation comments referencing the ADR-007 unit-test strategy
+  (scripted models are `#[cfg(test)]`-only fixtures, never shipped).
+- Gates ✅: `cargo fmt --check`, `cargo clippy --workspace --all-targets
+  --all-features -- -D warnings` (0), `cargo test --workspace`
+  (52 suites, 231 tests), **live gateway suite 14/14** (both models).

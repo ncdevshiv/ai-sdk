@@ -36,7 +36,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Full subsystem completion: `ai-memory` (four-tier + compaction),
+- **MCP dual-era**: `McpServer::enable_legacy()` serves legacy
+  initialize-handshake clients (2025-11-25) alongside modern stateless
+  clients; `McpClient::with_legacy()` performs the real handshake
+- **Native Anthropic adapter** (`anthropic.rs`): Messages API with
+  x-api-key/anthropic-version headers, tool use blocks, SSE streaming
+- **Native Google Gemini adapter** (`gemini.rs`): generateContent with
+  function declarations, inline images, SSE streaming
+- **Fine-tuning jobs API client** (`finetune.rs`): create/list/get/cancel
+  jobs, events, training-file upload (real OpenAI wire format)
+- `StructuredExtractor` + `LlmStructuredExtractor`: real schema-driven
+  extraction for `NativeResearchBackend::extract` (fail-fast without an
+  extractor — no more partial output)
+- GitHub Actions CI: fmt, clippy -D warnings, workspace tests, and a
+  credential-gated live-gateway job
+
+### Changed
+
+- `create_provider` routes `anthropic`/`google` to native adapters
+- README status badge updated to Verified
+
+ `ai-memory` (four-tier + compaction),
   `ai-rag` (chunking/hybrid retrieval/reranking), `ai-workflows` (DAG
   engine with checkpoints), `ai-agents` (agent runtime, sub-agents,
   swarms, HITL, self-healing retries), `ai-analytics`, `ai-devtools`,

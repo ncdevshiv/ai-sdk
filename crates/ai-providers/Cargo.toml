@@ -24,6 +24,7 @@ async-trait.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 futures.workspace = true
+bytes.workspace = true
 url.workspace = true
 thiserror.workspace = true
 
@@ -33,3 +34,4 @@ ai-errors = { path = "../ai-errors" }
 ai-agents = { path = "../ai-agents" }
 ai-tools = { path = "../ai-tools" }
 futures.workspace = true
+bytes.workspace = true

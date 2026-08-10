@@ -23,8 +23,9 @@
 //!   HTTP (`MCP-Protocol-Version` header, JSON responses, SSE for listen
 //!   streams).
 //!
-//! The legacy (2025-11-25 and earlier) initialize-handshake era is **not**
-//! implemented; dual-era support is a documented roadmap item.
+//! **Dual-era support**: a server may also speak the legacy
+//! initialize-handshake era (2025-11-25 and earlier) for clients that do
+//! not send modern per-request `_meta` (see [`McpServer::enable_legacy`]).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -244,9 +245,15 @@ pub enum ServerOutcome {
     Subscription(SubscriptionHandle),
 }
 
-/// An MCP server (2026-07-28, stateless per-request).
+/// The legacy protocol version served by dual-era mode.
+pub const LEGACY_PROTOCOL_VERSION: &str = "2025-11-25";
+
+/// An MCP server (2026-07-28 stateless per-request; optionally dual-era).
 pub struct McpServer {
     supported_versions: Vec<String>,
+    legacy_enabled: bool,
+    legacy_versions: Vec<String>,
+    legacy_mode: std::sync::atomic::AtomicBool,
     server_name: String,
     server_version: String,
     instructions: Option<String>,
@@ -265,6 +272,9 @@ impl McpServer {
     pub fn new() -> Self {
         Self {
             supported_versions: vec![PROTOCOL_VERSION_2026_07_28.to_string()],
+            legacy_enabled: false,
+            legacy_versions: vec![LEGACY_PROTOCOL_VERSION.to_string()],
+            legacy_mode: std::sync::atomic::AtomicBool::new(false),
             server_name: "ai-sdk-mcp".to_string(),
             server_version: "0.2.0".to_string(),
             instructions: None,
@@ -278,6 +288,21 @@ impl McpServer {
     pub fn with_supported_versions(mut self, versions: &[&str]) -> Self {
         self.supported_versions = versions.iter().map(|v| v.to_string()).collect();
         self
+    }
+
+    /// Enables dual-era mode: clients that do not send modern per-request
+    /// `_meta` are served the legacy initialize-handshake protocol
+    /// (`2025-11-25` and earlier semantics). Modern requests are always
+    /// served the modern way.
+    pub fn enable_legacy(mut self, versions: &[&str]) -> Self {
+        self.legacy_enabled = true;
+        self.legacy_versions = versions.iter().map(|v| v.to_string()).collect();
+        self
+    }
+
+    /// Whether the server is currently serving a legacy client.
+    pub fn in_legacy_mode(&self) -> bool {
+        self.legacy_mode.load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub fn with_instructions(mut self, instructions: impl Into<String>) -> Self {
@@ -417,6 +442,31 @@ impl McpServer {
     /// Handles one request. Returns a response or a subscription stream.
     pub async fn handle_request(&self, request: &JsonRpcRequest) -> ServerOutcome {
         let id = request.id.clone();
+
+        // Era detection (dual-era, spec: versioning/compatibility): a
+        // request carrying modern per-request `_meta` is served statelessly;
+        // an `initialize` request selects legacy semantics; anything else
+        // without `_meta` on a legacy-enabled server is served legacy.
+        let has_modern_meta = request
+            .params
+            .get("_meta")
+            .and_then(|m| m.get(META_PROTOCOL_VERSION))
+            .is_some();
+
+        if !has_modern_meta {
+            if self.legacy_enabled && request.method == "initialize" {
+                self.legacy_mode
+                    .store(true, std::sync::atomic::Ordering::Release);
+                return ServerOutcome::Respond(self.legacy_initialize_response(&id));
+            }
+            if self.legacy_enabled && self.in_legacy_mode() {
+                return self.handle_legacy_request(request);
+            }
+        } else {
+            // A modern client resets any legacy session.
+            self.legacy_mode
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
 
         // Per-request _meta validation (stateless protocol).
         let capabilities = match self.validate_meta(&request.params) {
@@ -566,6 +616,139 @@ impl McpServer {
                 format!("method not found: {}", request.method),
             )),
         }
+    }
+
+    /// The legacy `initialize` handshake response (2025-11-25 shape).
+    fn legacy_initialize_response(&self, id: &serde_json::Value) -> JsonRpcResponse {
+        JsonRpcResponse::ok(
+            id.clone(),
+            serde_json::json!({
+                "protocolVersion": self.legacy_versions.first().cloned().unwrap_or_else(|| LEGACY_PROTOCOL_VERSION.to_string()),
+                "capabilities": self.server_capabilities(),
+                "serverInfo": self.server_info(),
+            }),
+        )
+    }
+
+    /// Serves requests for a legacy (initialize-handshake) client: no
+    /// `resultType`, no `_meta` requirements, legacy result shapes.
+    fn handle_legacy_request(&self, request: &JsonRpcRequest) -> ServerOutcome {
+        let id = request.id.clone();
+        let result = match request.method.as_str() {
+            "tools/list" => serde_json::json!({
+                "tools": self.tools.values().map(|(t, _)| t).collect::<Vec<_>>(),
+            }),
+            "tools/call" => {
+                let name = request
+                    .params
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("");
+                let arguments = request
+                    .params
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                match self.tools.get(name) {
+                    Some((_tool, handler)) => {
+                        let future = handler.call(arguments, None);
+                        return match futures::executor::block_on(future) {
+                            Ok(HandlerOutcome::Complete(value)) => {
+                                ServerOutcome::Respond(JsonRpcResponse::ok(
+                                    id,
+                                    serde_json::json!({
+                                        "content": [{"type": "text", "text": serde_json::to_string(&value).unwrap_or_default()}],
+                                        "isError": false,
+                                    }),
+                                ))
+                            }
+                            Ok(HandlerOutcome::NeedsInput { .. }) => {
+                                ServerOutcome::Respond(JsonRpcResponse::err(
+                                    id,
+                                    ERROR_INTERNAL,
+                                    "legacy protocol does not support multi-round-trip requests",
+                                ))
+                            }
+                            Err(e) => ServerOutcome::Respond(JsonRpcResponse::ok(
+                                id,
+                                serde_json::json!({
+                                    "content": [{"type": "text", "text": e.to_string()}],
+                                    "isError": true,
+                                }),
+                            )),
+                        };
+                    }
+                    None => {
+                        return ServerOutcome::Respond(JsonRpcResponse::err(
+                            id,
+                            ERROR_INVALID_PARAMS,
+                            format!("unknown tool: {name}"),
+                        ));
+                    }
+                }
+            }
+            "resources/list" => serde_json::json!({
+                "resources": self.resources.values().map(|(r, _)| r).collect::<Vec<_>>(),
+            }),
+            "resources/read" => {
+                let uri = request
+                    .params
+                    .get("uri")
+                    .and_then(|u| u.as_str())
+                    .unwrap_or("");
+                match self.resources.get(uri) {
+                    Some((resource, contents)) => serde_json::json!({
+                        "contents": [{
+                            "uri": uri,
+                            "mimeType": resource.mime_type.clone().unwrap_or_else(|| "text/plain".into()),
+                            "text": contents,
+                        }]
+                    }),
+                    None => {
+                        return ServerOutcome::Respond(JsonRpcResponse::err(
+                            id,
+                            ERROR_INVALID_PARAMS,
+                            format!("unknown resource: {uri}"),
+                        ));
+                    }
+                }
+            }
+            "prompts/list" => serde_json::json!({
+                "prompts": self.prompts.values().collect::<Vec<_>>(),
+            }),
+            "prompts/get" => {
+                let name = request
+                    .params
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("");
+                match self.prompts.get(name) {
+                    Some(prompt) => serde_json::json!({
+                        "description": prompt.description,
+                        "messages": [{
+                            "role": "user",
+                            "content": {"type": "text", "text": prompt.description.clone().unwrap_or_default()}
+                        }],
+                    }),
+                    None => {
+                        return ServerOutcome::Respond(JsonRpcResponse::err(
+                            id,
+                            ERROR_INVALID_PARAMS,
+                            format!("unknown prompt: {name}"),
+                        ));
+                    }
+                }
+            }
+            "ping" => serde_json::json!({}),
+            _ => {
+                return ServerOutcome::Respond(JsonRpcResponse::err(
+                    id,
+                    ERROR_METHOD_NOT_FOUND,
+                    format!("method not found: {}", request.method),
+                ));
+            }
+        };
+        ServerOutcome::Respond(JsonRpcResponse::ok(id, result))
     }
 
     /// Handles `tools/call` including MRTR (input responses + request state).
@@ -722,6 +905,10 @@ pub struct McpClient {
     sampling: Option<SamplingResolver>,
     /// Maximum MRTR retry rounds for one request.
     max_rounds: u32,
+    /// Legacy (initialize-handshake) mode: no `_meta`, no `resultType`.
+    legacy: bool,
+    /// Whether the legacy handshake has completed.
+    legacy_ready: bool,
 }
 
 impl McpClient {
@@ -737,11 +924,20 @@ impl McpClient {
             elicitation: None,
             sampling: None,
             max_rounds: 4,
+            legacy: false,
+            legacy_ready: false,
         }
     }
 
     pub fn with_protocol_version(mut self, version: &str) -> Self {
         self.protocol_version = version.to_string();
+        self
+    }
+
+    /// Switches the client to the legacy (2025-11-25 initialize-handshake)
+    /// dialect: no per-request `_meta`, results without `resultType`.
+    pub fn with_legacy(mut self) -> Self {
+        self.legacy = true;
         self
     }
 
@@ -831,6 +1027,9 @@ impl McpClient {
         method: &str,
         params: serde_json::Value,
     ) -> Result<serde_json::Value, AiError> {
+        if self.legacy {
+            return self.call_legacy(method, params).await;
+        }
         let mut params = self.build_params(params);
         let mut round = 0u32;
 
@@ -909,6 +1108,70 @@ impl McpClient {
 
             return Ok(result);
         }
+    }
+
+    /// Performs the legacy initialize handshake (one request per
+    /// connection, per the 2025-11-25 semantics).
+    async fn legacy_handshake(&mut self) -> Result<(), AiError> {
+        let initialize = JsonRpcRequest::new(
+            self.next_id(),
+            "initialize",
+            serde_json::json!({
+                "protocolVersion": LEGACY_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": self.client_info,
+            }),
+        );
+        self.write_request(&initialize).await?;
+        let id = initialize.id.clone();
+        let response = self.read_response(&id).await?;
+        if let Some(error) = response.error {
+            return Err(map_mcp_error(error));
+        }
+        // Notify the server that initialization completed (legacy
+        // notification; no id, no response).
+        let notification =
+            JsonRpcNotification::new("notifications/initialized", serde_json::json!({}));
+        let mut line = serde_json::to_string(&notification)
+            .map_err(|e| AiError::Serialization(SerializationError::new(e.to_string())))?;
+        line.push('\n');
+        use tokio::io::AsyncWriteExt;
+        self.writer.write_all(line.as_bytes()).await.map_err(|e| {
+            AiError::Network(ai_errors::NetworkError::new("mcp write", e.to_string()))
+        })?;
+        self.writer.flush().await.map_err(|e| {
+            AiError::Network(ai_errors::NetworkError::new("mcp flush", e.to_string()))
+        })?;
+        self.legacy_ready = true;
+        Ok(())
+    }
+
+    /// True once the legacy initialize handshake has completed.
+    pub fn in_legacy_handshake_done(&self) -> bool {
+        self.legacy_ready
+    }
+
+    /// Calls a method in legacy mode: no `_meta`, no `resultType`, no MRTR.
+    async fn call_legacy(
+        &mut self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, AiError> {
+        if !self.legacy_ready {
+            self.legacy_handshake().await?;
+        }
+        let id = self.next_id();
+        let request = JsonRpcRequest::new(id.clone(), method, params);
+        self.write_request(&request).await?;
+        let response = self.read_response(&id).await?;
+        if let Some(error) = response.error {
+            return Err(map_mcp_error(error));
+        }
+        response.result.ok_or_else(|| {
+            AiError::Internal(ai_errors::InternalError::new(
+                "legacy response without result",
+            ))
+        })
     }
 
     /// Calls `server/discover` and returns the supported versions.
@@ -1091,7 +1354,14 @@ mod tests {
                     line.clear();
                     continue;
                 }
-                let request: JsonRpcRequest = serde_json::from_str(line.trim()).unwrap();
+                // Skip notifications (no id): legacy `initialized` and
+                // modern `notifications/*`.
+                let parsed: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+                if parsed.get("id").is_none() {
+                    line.clear();
+                    continue;
+                }
+                let request: JsonRpcRequest = serde_json::from_value(parsed).unwrap();
                 match server.handle_request(&request).await {
                     ServerOutcome::Respond(response) => {
                         writer
@@ -1291,6 +1561,43 @@ mod tests {
         let prompts = client.list_prompts().await.unwrap();
         assert_eq!(prompts.len(), 1);
         assert_eq!(prompts[0].name, "greet");
+    }
+
+    #[tokio::test]
+    async fn legacy_handshake_roundtrip_on_dual_era_server() {
+        let server = echo_server().enable_legacy(&["2025-11-25"]);
+        let mut client = spawn_server(server).with_legacy();
+
+        // Legacy initialize + initialized notification, then plain
+        // tools/list without _meta and without resultType.
+        let tools = client.list_tools().await.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "echo");
+
+        // A legacy tool call works without resultType.
+        let result = client
+            .call_tool("echo", serde_json::json!({"text": "legacy"}))
+            .await
+            .unwrap();
+        assert_eq!(result["content"][0]["text"], "{\"echo\":\"legacy\"}");
+    }
+
+    #[tokio::test]
+    async fn modern_and_legacy_clients_coexist() {
+        // Legacy client on one connection.
+        let mut legacy = spawn_server(echo_server().enable_legacy(&["2025-11-25"])).with_legacy();
+        let legacy_tools = legacy.list_tools().await.unwrap();
+        assert_eq!(legacy_tools.len(), 1);
+
+        // Modern client on a fresh connection still gets resultType.
+        let mut modern = spawn_server(echo_server().enable_legacy(&["2025-11-25"]));
+        let tools = modern.list_tools().await.unwrap();
+        assert_eq!(tools.len(), 1);
+        let result = modern
+            .call_tool("echo", serde_json::json!({"text": "modern"}))
+            .await
+            .unwrap();
+        assert_eq!(result["resultType"], "complete");
     }
 
     #[tokio::test]

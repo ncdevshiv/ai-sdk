@@ -237,6 +237,7 @@ dependencies = [
  "ai-tools",
  "ai-types",
  "async-trait",
+ "bytes",
  "futures",
  "reqwest",
  "serde",
@@ -407,8 +408,10 @@ version = "0.1.0"
 dependencies = [
  "ai-core",
  "ai-errors",
+ "ai-models",
  "ai-runtime",
  "ai-security",
+ "ai-types",
  "async-trait",
  "encoding_rs",
  "futures",
