@@ -4,10 +4,12 @@
 
 mod embeddings;
 mod semantic;
+mod statistical;
 mod working;
 
 pub use embeddings::{EmbeddingsError, EmbeddingsProvider, OpenAiCompatEmbeddings};
-pub use semantic::{SemanticMemory, SemanticMemoryConfig};
+pub use semantic::{SemanticFact, SemanticMemory, SemanticMemoryConfig};
+pub use statistical::{StatisticalConfig, StatisticalEmbeddings};
 pub use working::{CompactionStrategy, WorkingMemory};
 
 use std::sync::Arc;

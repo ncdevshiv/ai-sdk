@@ -385,6 +385,15 @@ fn build_chat_body(request: &ChatRequest, model: &str, stream: bool) -> Result<V
     if let Some(temperature) = request.temperature {
         body["temperature"] = json!(temperature);
     }
+    if let Some(top_p) = request.top_p {
+        body["top_p"] = json!(top_p);
+    }
+    if let Some(frequency_penalty) = request.frequency_penalty {
+        body["frequency_penalty"] = json!(frequency_penalty);
+    }
+    if let Some(presence_penalty) = request.presence_penalty {
+        body["presence_penalty"] = json!(presence_penalty);
+    }
     if let Some(max_tokens) = request.max_tokens {
         body["max_tokens"] = json!(max_tokens);
     }

@@ -33,5 +33,8 @@ ai-runtime = { path = "../ai-runtime" }
 ai-errors = { path = "../ai-errors" }
 ai-agents = { path = "../ai-agents" }
 ai-tools = { path = "../ai-tools" }
+ai-memory = { path = "../ai-memory" }
+ai-rag = { path = "../ai-rag" }
+ai-storage = { path = "../ai-storage" }
 futures.workspace = true
 bytes.workspace = true

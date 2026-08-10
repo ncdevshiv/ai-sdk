@@ -1,5 +1,5 @@
 //! Web subsystem (spec §11–§12): real fetching, HTML extraction, robots
-//! policy, bounded crawling, search providers, and a Firecrawl-compatible
+//! policy, bounded crawling, search providers, and a self-hosted
 //! research layer — all behind a native implementation, no fake backends.
 
 mod crawler;
@@ -11,8 +11,8 @@ mod search;
 pub use crawler::{CrawlConfig, CrawlResult, Crawler, Page};
 pub use extract::{extract_links, extract_metadata, html_to_text};
 pub use research::{
-    ExtractRequest, FirecrawlBackend, LlmStructuredExtractor, MapRequest, NativeResearchBackend,
-    ResearchBackend, ScrapeRequest, SearchRequest, StructuredExtractor,
+    ExtractRequest, LlmStructuredExtractor, MapRequest, NativeResearchBackend, ResearchBackend,
+    ScrapeRequest, SearchRequest, StructuredExtractor,
 };
 pub use robots::RobotsPolicy;
 pub use search::{DuckDuckGoSearch, SearchProvider, SearchResult};

@@ -14,7 +14,7 @@ The AI SDK is a Rust workspace of focused crates:
 - **Protocols**: `ai-protocols` (MCP 2026-07-28 stateless client/server,
   A2A client/server).
 - **Web**: `ai-web` (fetch, crawl, robots, extraction, search, research
-  backends incl. Firecrawl adapter).
+  backends; fully self-hosted).
 - **Operations**: `ai-observability` (events/chronological reports),
   `ai-analytics` (metrics), `ai-devtools` (inspector/traces), `ai-security`
   (redaction, PII, SSRF), `ai-cache`, `ai-storage` (KV/doc/vector, sqlite).

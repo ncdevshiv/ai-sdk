@@ -162,6 +162,7 @@ dependencies = [
 name = "ai-memory"
 version = "0.1.0"
 dependencies = [
+ "ai-cache",
  "ai-config",
  "ai-core",
  "ai-errors",
@@ -231,8 +232,11 @@ dependencies = [
  "ai-config",
  "ai-core",
  "ai-errors",
+ "ai-memory",
  "ai-models",
+ "ai-rag",
  "ai-runtime",
+ "ai-storage",
  "ai-stream",
  "ai-tools",
  "ai-types",

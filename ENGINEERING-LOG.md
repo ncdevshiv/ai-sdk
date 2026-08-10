@@ -422,3 +422,44 @@ re-run to confirm.
 - Gates ✅: `cargo fmt --check`, `cargo clippy --workspace --all-targets
   --all-features -- -D warnings` (0), `cargo test --workspace`
   (52 suites, 231 tests), **live gateway suite 14/14** (both models).
+
+---
+
+## 2026-08-10 — Session 5: Fully Self-Hosted + OpenAI-Compatible Focus
+
+### Entry 22 — Firecrawl removed (self-hosted philosophy)
+- **What:** the external Firecrawl REST adapter, `FIRECRAWL_API_KEY`, and
+  all references were **removed** from code, config, docs, and spec. The
+  web research layer is now fully self-hosted: native fetch/crawl/extract
+  + `StructuredExtractor`/`LlmStructuredExtractor` for schema-driven
+  extraction. Rationale: no reason to depend on an external scraping API
+  when the SDK ships its own crawler and LLM-driven extraction.
+
+### Entry 23 — Self-hosted embeddings (no external service)
+- **What:** `StatisticalEmbeddings` (`ai-memory/statistical.rs`) — real
+  feature-hashing embeddings (FNV-1a signed hashing, log term-frequency
+  weighting, L2 normalization, power-of-two dimensions). Used by semantic
+  memory and RAG with zero external dependencies.
+- **Gateway probe (verified 2026-08-10):** `POST /embeddings` and
+  `POST /audio/speech` return **HTTP 404** on the project gateway — it
+  only routes `/chat/completions` and `/models`. Local embeddings are
+  therefore the correct self-hosted path; the OpenAI-compatible embeddings
+  adapter remains for hosts that expose the endpoint.
+- **Tests:** similarity ordering, identical-text near-1.0, empty text,
+  dimension rounding. ✅ 15/15 ai-memory tests.
+
+### Entry 24 — OpenAI-compatible adapter improvements
+- `ChatRequest` gains `top_p`, `frequency_penalty`, `presence_penalty`
+  (serde-optional) and the OpenAI-compatible adapter serializes them.
+  ✅ 30/30 provider tests.
+
+### Entry 25 — Live verification (only deepseek-v4-flash + mimo-v2.5)
+- **Self-hosted RAG live:** StatisticalEmbeddings + in-memory vector store
+  + gateway LLM — retrieval ranked the vision chunk first (score 0.268),
+  and `deepseek-v4-flash` answered "Mimo-v2.5" grounded in the retrieved
+  context. ✅
+- **Self-hosted semantic memory live:** local embeddings ranked the vision
+  fact first (score 0.500). ✅
+- Full live suite: **16/16 PASS** (only the two models). ✅
+- Gates: fmt clean, clippy `-D warnings` 0 errors, workspace 52 suites /
+  237 tests. ✅

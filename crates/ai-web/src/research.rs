@@ -1,5 +1,6 @@
-//! Research layer (spec §12): Firecrawl-like operations implemented natively
-//! and via the real Firecrawl REST API behind a common trait.
+//! Research layer (spec §12): Firecrawl-compatible operations implemented
+//! fully natively and self-hosted behind a common trait — no external
+//! scraping service required.
 
 use std::collections::BTreeMap;
 
@@ -29,7 +30,7 @@ pub struct MapResult {
     pub urls: Vec<String>,
 }
 
-/// Firecrawl-compatible research operations (spec §12).
+/// Research operations (spec §12), self-hosted.
 #[async_trait]
 pub trait ResearchBackend: Send + Sync {
     async fn search(&self, request: SearchRequest) -> Result<Vec<ResearchPage>, AiError>;
@@ -42,7 +43,7 @@ pub trait ResearchBackend: Send + Sync {
     ) -> Result<BTreeMap<String, serde_json::Value>, AiError>;
 }
 
-/// Request shapes (Firecrawl-compatible field names).
+/// Request shapes (compatible with the Firecrawl-style field names).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchRequest {
     pub query: String,
@@ -254,193 +255,6 @@ impl ResearchBackend for NativeResearchBackend {
             result.insert("data".into(), data);
         }
         Ok(result)
-    }
-}
-
-/// Firecrawl REST API backend (real adapter; requires `FIRECRAWL_API_KEY`).
-///
-/// Uses `https://api.firecrawl.dev/v1` endpoints: `/search`, `/scrape`,
-/// `/crawl`, `/map`, `/extract`.
-pub struct FirecrawlBackend {
-    api_key: String,
-    base_url: String,
-    client: reqwest::Client,
-}
-
-impl FirecrawlBackend {
-    pub fn new(api_key: impl Into<String>) -> Result<Self, AiError> {
-        Self::with_base_url(api_key, "https://api.firecrawl.dev/v1")
-    }
-
-    pub fn with_base_url(api_key: impl Into<String>, base_url: &str) -> Result<Self, AiError> {
-        Ok(Self {
-            api_key: api_key.into(),
-            base_url: base_url.trim_end_matches('/').to_string(),
-            client: reqwest::Client::builder()
-                .user_agent("ai-sdk/0.1")
-                .build()
-                .map_err(|e| AiError::Web(WebError::new("firecrawl client", e.to_string())))?,
-        })
-    }
-
-    async fn post_json(
-        &self,
-        path: &str,
-        body: serde_json::Value,
-    ) -> Result<serde_json::Value, AiError> {
-        let response = self
-            .client
-            .post(format!("{}/{path}", self.base_url))
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| AiError::Web(WebError::new("firecrawl", e.to_string())))?;
-
-        let status = response.status();
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|e| AiError::Web(WebError::new("firecrawl", e.to_string())))?
-            .to_vec();
-        if !status.is_success() {
-            return Err(AiError::Web(WebError::new(
-                "firecrawl",
-                format!("HTTP {status}: {}", String::from_utf8_lossy(&bytes)),
-            )));
-        }
-        serde_json::from_slice(&bytes)
-            .map_err(|e| AiError::Web(WebError::new("firecrawl", format!("invalid JSON: {e}"))))
-    }
-}
-
-#[async_trait]
-impl ResearchBackend for FirecrawlBackend {
-    async fn search(&self, request: SearchRequest) -> Result<Vec<ResearchPage>, AiError> {
-        let json = self
-            .post_json(
-                "search",
-                serde_json::json!({"query": request.query, "limit": request.limit}),
-            )
-            .await?;
-        let data = json
-            .get("data")
-            .and_then(|d| d.as_array())
-            .cloned()
-            .unwrap_or_default();
-        Ok(data
-            .into_iter()
-            .map(|item| ResearchPage {
-                url: item
-                    .get("url")
-                    .and_then(|u| u.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                title: item.get("title").and_then(|t| t.as_str()).map(String::from),
-                markdown: item
-                    .get("markdown")
-                    .and_then(|m| m.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                metadata: BTreeMap::new(),
-            })
-            .collect())
-    }
-
-    async fn scrape(&self, request: ScrapeRequest) -> Result<ResearchPage, AiError> {
-        let json = self
-            .post_json("scrape", serde_json::json!({"url": request.url}))
-            .await?;
-        let data = json.get("data").cloned().unwrap_or(json);
-        Ok(ResearchPage {
-            url: data
-                .get("url")
-                .and_then(|u| u.as_str())
-                .unwrap_or(&request.url)
-                .to_string(),
-            title: data.get("title").and_then(|t| t.as_str()).map(String::from),
-            markdown: data
-                .get("markdown")
-                .and_then(|m| m.as_str())
-                .unwrap_or("")
-                .to_string(),
-            metadata: BTreeMap::new(),
-        })
-    }
-
-    async fn crawl(&self, request: CrawlRequest) -> Result<Vec<ResearchPage>, AiError> {
-        let json = self
-            .post_json(
-                "crawl",
-                serde_json::json!({
-                    "url": request.url,
-                    "limit": request.limit,
-                    "maxDepth": request.max_depth
-                }),
-            )
-            .await?;
-        let data = json
-            .get("data")
-            .and_then(|d| d.as_array())
-            .cloned()
-            .unwrap_or_default();
-        Ok(data
-            .into_iter()
-            .map(|item| ResearchPage {
-                url: item
-                    .get("url")
-                    .and_then(|u| u.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                title: item.get("title").and_then(|t| t.as_str()).map(String::from),
-                markdown: item
-                    .get("markdown")
-                    .and_then(|m| m.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                metadata: BTreeMap::new(),
-            })
-            .collect())
-    }
-
-    async fn map(&self, request: MapRequest) -> Result<MapResult, AiError> {
-        let json = self
-            .post_json(
-                "map",
-                serde_json::json!({"url": request.url, "limit": request.limit}),
-            )
-            .await?;
-        let urls = json
-            .get("links")
-            .and_then(|l| l.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-        Ok(MapResult { urls })
-    }
-
-    async fn extract(
-        &self,
-        request: ExtractRequest,
-    ) -> Result<BTreeMap<String, serde_json::Value>, AiError> {
-        let json = self
-            .post_json(
-                "extract",
-                serde_json::json!({"urls": [request.url], "schema": request.schema}),
-            )
-            .await?;
-        let mut map = BTreeMap::new();
-        if let Some(data) = json.get("data") {
-            if let Some(obj) = data.as_object() {
-                for (key, value) in obj {
-                    map.insert(key.clone(), value.clone());
-                }
-            }
-        }
-        Ok(map)
     }
 }
 

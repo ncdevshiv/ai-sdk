@@ -36,6 +36,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Fully self-hosted**: removed the external Firecrawl REST adapter and
+  `FIRECRAWL_API_KEY`; web research is now 100% native + LLM-driven
+  extraction
+- `StatisticalEmbeddings`: real local feature-hashing embeddings (FNV-1a,
+  log term-frequency, L2 normalization) for semantic memory and RAG with
+  zero external services
+- `ChatRequest.top_p` / `frequency_penalty` / `presence_penalty` wired
+  through the OpenAI-compatible adapter
+- Live self-hosted tests: RAG retrieval → grounded answer
+  ("Mimo-v2.5"), semantic-memory ranking — both with `deepseek-v4-flash`
+  only (16/16 live suite)
+
+### Changed
+
+- Web research layer documented as self-hosted (no external scraping API)
+
+### Added
+
 - **MCP dual-era**: `McpServer::enable_legacy()` serves legacy
   initialize-handshake clients (2025-11-25) alongside modern stateless
   clients; `McpClient::with_legacy()` performs the real handshake

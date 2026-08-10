@@ -37,7 +37,7 @@ no stubs, no placeholders).
 | [`ai-tools`](crates/ai-tools) | Tool framework, built-in tools, skills registry |
 | [`ai-protocols`](crates/ai-protocols) | MCP client/server, A2A client/server |
 | [`ai-agents`](crates/ai-agents) | Agent runtime, sub-agents, patterns, swarms, self-healing |
-| [`ai-web`](crates/ai-web) | Web subsystem: crawler, extractor, search, Firecrawl backend |
+| [`ai-web`](crates/ai-web) | Web subsystem: crawler, extractor, search (self-hosted) |
 | [`ai-memory`](crates/ai-memory) | 4-tier memory with pluggable storage |
 | [`ai-rag`](crates/ai-rag) | RAG: chunking, ingestion, retrieval, hybrid search |
 | [`ai-workflows`](crates/ai-workflows) | Workflow engine: sequential/parallel/conditional, checkpoints |

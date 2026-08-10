@@ -60,7 +60,6 @@ Before writing substantial code:
    - Ollama (local OpenAI-compatible)
    - MCP spec (Streamable HTTP / stdio, tools, resources, prompts)
    - A2A spec (agent cards, tasks)
-   - Firecrawl API (search/scrape/crawl/map/extract) — for the backend adapter
    - Web standards relevant to crawling (robots.txt, sitemap, Content-Type, encodings)
 4. Verify API contracts, auth mechanisms, request schemas, streaming protocols, error formats, rate limits.
 5. Prefer official documentation and authoritative specifications. Do not invent APIs.
@@ -79,7 +78,7 @@ If documentation is unavailable or ambiguous, identify the uncertainty explicitl
 - Parallel execution engine with concurrency control (fan-out/fan-in, race, fallback, deadlines, cancellation, retries, backoff, jitter, circuit breaker).
 - Agent runtime: lifecycle states, instructions/context/state, tool loops, sub-agents, delegation, agent-to-agent (A2A), event emission, traces, HITL hooks.
 - Tool system: typed schemas (JSON Schema), validation, permissions, timeouts, cancellation, tracing; built-in tools (http, fs, time, math, web); MCP client and server.
-- Web subsystem: HTTP client, HTML fetch, robots-aware crawling, redirects, caching, content extraction (HTML→text), metadata, link discovery, concurrent crawl with limits, rate limiting; search provider trait with native (e.g., DuckDuckGo/Bing RSS or documented) + Firecrawl API backends.
+- Web subsystem: HTTP client, HTML fetch, robots-aware crawling, redirects, caching, content extraction (HTML→text), metadata, link discovery, concurrent crawl with limits, rate limiting; search provider trait with native (DuckDuckGo) backend — fully self-hosted, no external scraping API.
 - Memory: 4-tier model with trait-based storage; in-process implementations; real external adapters where implemented (e.g., sqlite); embeddings via provider adapters.
 - RAG: chunking strategies, ingestion, vector store trait (in-process + real adapters), hybrid/keyword retrieval, reranking interface, context assembly.
 - Workflows: sequential/parallel/conditional/fan-out/fan-in, retries, timeouts, cancellation, checkpoints, state, result propagation.
@@ -148,7 +147,7 @@ F:\alisia\ai-sdk\
 │   ├── ai-agents/             # agent runtime, lifecycle, sub-agents, patterns,
 │   │                          #   swarms, self-healing, HITL, traces
 │   ├── ai-web/                # HTTP client, crawler, extractor, parser, robots,
-│   │                          #   cache, search providers, Firecrawl backend
+│   │                          #   cache, search providers (self-hosted)
 │   ├── ai-memory/             # 4-tier memory, embeddings trait, storage trait,
 │   │                          #   in-process + sqlite adapters, compaction
 │   ├── ai-rag/                # chunking, ingestion, vector store trait, retrieval,
@@ -261,9 +260,10 @@ Serious built-in web/research subsystem (template §9), no fake abstraction:
 
 ---
 
-## 12. Firecrawl-Compatible / Advanced Web Research Layer
+## 12. Advanced Web Research Layer (self-hosted)
 
-Template §10 + PRD web research ambitions:
+Template §10 + PRD web research ambitions — implemented fully natively; no
+external scraping service:
 
 - Operations: `search`, `scrape`, `crawl`, `map`, `extract`, `research`.
 - Support: single-page scraping, multi-page crawling, URL discovery, search, content extraction, structured extraction, concurrent page processing, crawl/depth limits, domain restrictions, include/exclude patterns, deduplication, caching, rate limiting, error recovery.
@@ -272,11 +272,11 @@ Template §10 + PRD web research ambitions:
 ```text
 WebBackend
 ├── NativeHttpBackend   (real, implemented)
-├── SearchBackend       (real, implemented)
-└── FirecrawlBackend    (real API adapter; requires FIRECRAWL_API_KEY)
+└── SearchBackend       (real, implemented)
 ```
 
-No vendor lock-in; nothing claimed "built-in" unless actually implemented.
+Structured extraction is performed by the model via
+`StructuredExtractor`/`LlmStructuredExtractor` — fully self-hosted.
 
 ---
 
@@ -530,7 +530,7 @@ Template §31, incremental, repo always compiling:
 9. `ai-tools` + built-ins + skills registry
 10. `ai-protocols` (MCP, then A2A)
 11. `ai-agents` runtime + patterns + swarms + self-healing
-12. `ai-web` crawler/extractor/search + Firecrawl backend
+12. `ai-web` crawler/extractor/search (self-hosted)
 13. `ai-memory` + `ai-rag`
 14. `ai-workflows`
 15. `ai-observability` + chronological events

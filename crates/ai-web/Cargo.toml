@@ -1,6 +1,6 @@
 [package]
 name = "ai-web"
-description = "Web subsystem: HTTP client, crawler, extractor, parser, robots policy, search providers, Firecrawl backend"
+description = "Web subsystem: HTTP client, crawler, extractor, parser, robots policy, search providers (self-hosted)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -34,8 +34,8 @@ pub use ai_tools::{Tool, ToolContext, ToolOutput, ToolRegistry, default_tools, r
 pub use ai_types::{Completion, ContentPart, Message, Role, StreamEvent, Usage};
 pub use ai_voice::{Audio, SpeechToText, TextToSpeech, VoiceActivityDetector};
 pub use ai_web::{
-    Crawler, DuckDuckGoSearch, FirecrawlBackend, NativeResearchBackend, ResearchBackend,
-    RobotsPolicy, SearchProvider, WebClient,
+    Crawler, DuckDuckGoSearch, NativeResearchBackend, ResearchBackend, RobotsPolicy,
+    SearchProvider, WebClient,
 };
 pub use ai_workflows::{Node, NodeBuilder, NodeHandler, Workflow};
 

@@ -87,6 +87,15 @@ pub struct ChatRequest {
     /// Sampling temperature in `[0, 2]`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
+    /// Nucleus sampling: cumulative probability cutoff in `(0, 1]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f32>,
+    /// Frequency penalty in `[-2, 2]` (OpenAI-compatible providers).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frequency_penalty: Option<f32>,
+    /// Presence penalty in `[-2, 2]` (OpenAI-compatible providers).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presence_penalty: Option<f32>,
     /// Maximum number of output tokens.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u64>,
@@ -109,6 +118,9 @@ impl Default for ChatRequest {
             messages: Vec::new(),
             tools: Vec::new(),
             temperature: None,
+            top_p: None,
+            frequency_penalty: None,
+            presence_penalty: None,
             max_tokens: None,
             response_format: ResponseFormat::Text,
             stop: Vec::new(),
@@ -132,6 +144,21 @@ impl ChatRequest {
 
     pub fn with_temperature(mut self, temperature: f32) -> Self {
         self.temperature = Some(temperature);
+        self
+    }
+
+    pub fn with_top_p(mut self, top_p: f32) -> Self {
+        self.top_p = Some(top_p);
+        self
+    }
+
+    pub fn with_frequency_penalty(mut self, penalty: f32) -> Self {
+        self.frequency_penalty = Some(penalty);
+        self
+    }
+
+    pub fn with_presence_penalty(mut self, penalty: f32) -> Self {
+        self.presence_penalty = Some(penalty);
         self
     }
 

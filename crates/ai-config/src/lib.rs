@@ -26,7 +26,6 @@ pub mod env_keys {
     pub const GOOGLE_API_KEY: &str = "GOOGLE_API_KEY";
     pub const OPENROUTER_API_KEY: &str = "OPENROUTER_API_KEY";
     pub const OLLAMA_BASE_URL: &str = "OLLAMA_BASE_URL";
-    pub const FIRECRAWL_API_KEY: &str = "FIRECRAWL_API_KEY";
     pub const GATEWAY_BASE_URL: &str = "AI_SDK_GATEWAY_BASE_URL";
     pub const GATEWAY_API_KEY: &str = "AI_SDK_GATEWAY_API_KEY";
     pub const CONFIG_FILE: &str = "AI_SDK_CONFIG";
@@ -194,11 +193,6 @@ impl Config {
             &mut self.providers,
             "openrouter",
             env_keys::OPENROUTER_API_KEY,
-        );
-        set_env(
-            &mut self.providers,
-            "firecrawl",
-            env_keys::FIRECRAWL_API_KEY,
         );
         if let Ok(base) = std::env::var(env_keys::OLLAMA_BASE_URL) {
             let entry = self.providers.entry("ollama".to_string()).or_default();

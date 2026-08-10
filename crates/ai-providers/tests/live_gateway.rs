@@ -808,3 +808,135 @@ async fn agent_tool_loop_live_primary_model() {
         result.text.trim()
     );
 }
+
+// ---------------------------------------------------------------------------
+// Self-hosted RAG + semantic memory (live, primary model only): embeddings
+// are computed locally (StatisticalEmbeddings) — no external service.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn rag_self_hosted_live_answer_from_retrieved_context() {
+    let gateway = gateway_from_env();
+    if !gateway_available(&gateway) {
+        eprintln!("SKIP: gateway env not set");
+        return;
+    }
+    let gateway = gateway.unwrap();
+    let client = Arc::new(build_client(&gateway));
+    let reference = format!("{}:{}", gateway.provider_id, gateway.primary_model);
+
+    // Self-hosted pipeline: local statistical embeddings + in-memory store.
+    let store: Arc<dyn ai_storage::VectorStore> =
+        Arc::new(ai_storage::InMemoryVectorStore::new(1000));
+    let embeddings: Arc<dyn ai_memory::EmbeddingsProvider> =
+        Arc::new(ai_memory::StatisticalEmbeddings::defaults());
+    let pipeline = ai_rag::RagPipeline::new(
+        store,
+        embeddings,
+        ai_rag::RagConfig {
+            chunking: ai_rag::ChunkingStrategy::Fixed {
+                size: 400,
+                overlap: 40,
+            },
+            min_similarity: 0.2,
+            ..Default::default()
+        },
+    );
+
+    let document = "The AI SDK gateway routes requests to deepseek-v4-flash, which is a fast \
+                    reasoning model. The gateway base URL is opencode.ai/zen/go/v1 and it speaks \
+                    the OpenAI-compatible protocol with DeepSeek-style reasoning content. \
+                    Mimo-v2.5 is the vision model used for image inputs.";
+    pipeline.ingest("gateway-doc", document).await.unwrap();
+
+    let retrieved = pipeline
+        .retrieve("which model handles vision inputs?", 2)
+        .await
+        .unwrap();
+    assert!(!retrieved.is_empty(), "retrieval must return chunks");
+    assert!(
+        retrieved
+            .iter()
+            .any(|c| c.text.contains("mimo") || c.text.contains("vision")),
+        "retrieved chunk must mention the vision model: {:?}",
+        retrieved.iter().map(|c| &c.text).collect::<Vec<_>>()
+    );
+
+    // Ground the answer in the retrieved context using the primary model.
+    let context = ai_rag::ContextAssembler::default().assemble(&retrieved);
+    let prompt = format!(
+        "Answer from the context only.\n\n{context}\n\nQuestion: which model handles vision inputs?"
+    );
+    let completion = client
+        .generate(&reference, vec![Message::text(Role::User, &prompt)])
+        .await
+        .expect("generation succeeds");
+    assert!(
+        completion.text.to_lowercase().contains("mimo"),
+        "answer must reference mimo: {:?}",
+        completion.text
+    );
+    eprintln!(
+        "PASS: self-hosted RAG ({} chunks, top score {:.3}) → {:?}",
+        retrieved.len(),
+        retrieved[0].score,
+        completion.text.trim()
+    );
+}
+
+#[tokio::test]
+async fn semantic_memory_self_hosted_live() {
+    let gateway = gateway_from_env();
+    if !gateway_available(&gateway) {
+        eprintln!("SKIP: gateway env not set");
+        return;
+    }
+    let gateway = gateway.unwrap();
+    let _ = gateway; // semantic memory uses local embeddings only
+
+    let embeddings: Arc<dyn ai_memory::EmbeddingsProvider> =
+        Arc::new(ai_memory::StatisticalEmbeddings::defaults());
+    let memory = ai_memory::SemanticMemory::new(
+        embeddings,
+        ai_memory::SemanticMemoryConfig {
+            min_similarity: 0.3,
+            ..Default::default()
+        },
+    );
+
+    memory
+        .store(ai_memory::SemanticFact {
+            id: "fact-1".into(),
+            text: "the primary model is deepseek-v4-flash".into(),
+            metadata: serde_json::json!({"type": "model"}),
+        })
+        .await
+        .unwrap();
+    memory
+        .store(ai_memory::SemanticFact {
+            id: "fact-2".into(),
+            text: "the vision model is mimo-v2.5".into(),
+            metadata: serde_json::json!({"type": "model"}),
+        })
+        .await
+        .unwrap();
+
+    let results = memory
+        .retrieve("which model is used for vision?", 2)
+        .await
+        .unwrap();
+    assert!(!results.is_empty(), "retrieval must return facts");
+    assert_eq!(
+        results[0].0.id,
+        "fact-2",
+        "vision fact ranks first: {:?}",
+        results
+            .iter()
+            .map(|(f, s)| (f.id.as_str(), s))
+            .collect::<Vec<_>>()
+    );
+    eprintln!(
+        "PASS: self-hosted semantic memory — top fact `{}` (score {:.3})",
+        results[0].0.id, results[0].1
+    );
+}
