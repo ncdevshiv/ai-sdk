@@ -93,10 +93,13 @@ Truth-sprint hardening — 2026-08-10:
   retry backoff switched to decorrelated jitter
 - `ai-stream`: property-test harness aligned with the SSE serializer
   (round-trip parity)
-- `.github/workflows/ci.yml`: live-gateway job gate fixed — job-level
-  `if` cannot access the `secrets` context (evaluated empty, so the
-  job never ran); credentials are now exposed at workflow-level `env`
-  and gated via `if: env.AI_SDK_GATEWAY_API_KEY != ''`
+- `.github/workflows/ci.yml`: live-gateway job gate fixed — a job-level
+  `if` can access neither the `secrets` nor the `env` context (only
+  `github`/`inputs`/`needs`/`vars`; gating on `env.… != ''` at job level
+  made the whole workflow invalid). Credentials are exposed at
+  workflow-level `env` and the gate is applied per step via
+  `if: env.AI_SDK_GATEWAY_API_KEY != ''`, which is valid where `env`
+  exists; without secrets the job is a green no-op
 
 ### Added
 
