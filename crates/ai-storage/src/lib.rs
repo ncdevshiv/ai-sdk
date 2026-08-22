@@ -306,11 +306,20 @@ mod tests {
     use super::*;
 
     fn temp_db() -> SqliteStore {
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir();
-        let path = dir.join(format!("ai-sdk-test-{}.sqlite", std::process::id()));
-        let store = SqliteStore::open(&path).expect("sqlite opens");
-        std::fs::remove_file(&path).ok();
-        store
+        // Unique per call: parallel #[tokio::test]s share one process (and
+        // therefore pid), so the old single pid-keyed path made every test
+        // race on the same file; combined with deleting it while open this
+        // surfaced as "attempt to write a readonly database" on loaded
+        // Linux runners.
+        let path = dir.join(format!(
+            "ai-sdk-test-{}-{}.sqlite",
+            std::process::id(),
+            NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::remove_file(&path).ok(); // stale leftover of a crashed run
+        SqliteStore::open(&path).expect("sqlite opens")
     }
 
     #[tokio::test]
