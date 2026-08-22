@@ -1,11 +1,13 @@
 //! Live integration tests against the real project gateway.
 //!
 //! These tests perform **real HTTP calls** — no mocks, no fake providers.
-//! They are gated on the environment variables below; when absent they skip
-//! with a message (standard credential gating), but the CI/verification run
-//! executes them for real against `https://opencode.ai/zen/go/v1`.
+//! Like `hercules_bench` / `orchestra_live`, every test is `#[ignore]`d AND
+//! credential-gated: plain `cargo test` never touches the network; run them
+//! explicitly with `-- --ignored` and the environment below. When the
+//! variables are absent or blank, each test skips with a message instead of
+//! calling anything.
 //!
-//! Required env (see `.env`):
+//! Required env (see `.env.example`):
 //! - `AI_SDK_GATEWAY_BASE_URL`
 //! - `AI_SDK_GATEWAY_API_KEY`
 //! - `AI_SDK_PRIMARY_MODEL`    (deepseek-v4-flash)
@@ -36,8 +38,16 @@ struct Gateway {
 }
 
 fn gateway_from_env() -> Option<Gateway> {
-    let base_url = std::env::var("AI_SDK_GATEWAY_BASE_URL").ok()?;
-    let api_key = std::env::var("AI_SDK_GATEWAY_API_KEY").ok()?;
+    // Blank env values count as unset (same rule as `ai-config`): CI
+    // workflows commonly export `ENV: ${{ secrets.ENV }}`, which creates
+    // EMPTY variables when the secret does not exist. Treating empty as
+    // configured would fire real calls at an empty base URL.
+    let base_url = std::env::var("AI_SDK_GATEWAY_BASE_URL")
+        .ok()
+        .filter(|v| !v.trim().is_empty())?;
+    let api_key = std::env::var("AI_SDK_GATEWAY_API_KEY")
+        .ok()
+        .filter(|v| !v.trim().is_empty())?;
     let primary_model =
         std::env::var("AI_SDK_PRIMARY_MODEL").unwrap_or_else(|_| "deepseek-v4-flash".to_string());
     let vision_model =
@@ -81,6 +91,7 @@ fn gateway_available(gateway: &Option<Gateway>) -> bool {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[ignore = "live gateway suite: real HTTP calls; run with -- --ignored and AI_SDK_GATEWAY_* env set"]
 async fn list_models_contains_primary_and_vision() {
     let gateway = gateway_from_env();
     if !gateway_available(&gateway) {
@@ -113,6 +124,7 @@ async fn list_models_contains_primary_and_vision() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[ignore = "live gateway suite: real HTTP calls; run with -- --ignored and AI_SDK_GATEWAY_* env set"]
 async fn generate_non_streaming_primary_exact_reply() {
     let gateway = gateway_from_env();
     if !gateway_available(&gateway) {
@@ -144,6 +156,7 @@ async fn generate_non_streaming_primary_exact_reply() {
 }
 
 #[tokio::test]
+#[ignore = "live gateway suite: real HTTP calls; run with -- --ignored and AI_SDK_GATEWAY_* env set"]
 async fn generate_exposes_reasoning_content() {
     let gateway = gateway_from_env();
     if !gateway_available(&gateway) {
@@ -179,6 +192,7 @@ async fn generate_exposes_reasoning_content() {
 }
 
 #[tokio::test]
+#[ignore = "live gateway suite: real HTTP calls; run with -- --ignored and AI_SDK_GATEWAY_* env set"]
 async fn generate_reports_usage_and_finish_reason() {
     let gateway = gateway_from_env();
     if !gateway_available(&gateway) {
@@ -219,6 +233,7 @@ async fn generate_reports_usage_and_finish_reason() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[ignore = "live gateway suite: real HTTP calls; run with -- --ignored and AI_SDK_GATEWAY_* env set"]
 async fn stream_primary_collects_expected_text() {
     let gateway = gateway_from_env();
     if !gateway_available(&gateway) {
@@ -248,6 +263,7 @@ async fn stream_primary_collects_expected_text() {
 }
 
 #[tokio::test]
+#[ignore = "live gateway suite: real HTTP calls; run with -- --ignored and AI_SDK_GATEWAY_* env set"]
 async fn stream_emits_unified_events() {
     let gateway = gateway_from_env();
     if !gateway_available(&gateway) {
@@ -318,6 +334,7 @@ fn calculator_tool() -> ToolDefinition {
 }
 
 #[tokio::test]
+#[ignore = "live gateway suite: real HTTP calls; run with -- --ignored and AI_SDK_GATEWAY_* env set"]
 async fn tool_calling_full_loop_returns_42() {
     let gateway = gateway_from_env();
     if !gateway_available(&gateway) {
@@ -396,6 +413,7 @@ async fn tool_calling_full_loop_returns_42() {
 }
 
 #[tokio::test]
+#[ignore = "live gateway suite: real HTTP calls; run with -- --ignored and AI_SDK_GATEWAY_* env set"]
 async fn streamed_tool_call_is_finalized() {
     let gateway = gateway_from_env();
     if !gateway_available(&gateway) {
@@ -433,6 +451,7 @@ async fn streamed_tool_call_is_finalized() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[ignore = "live gateway suite: real HTTP calls; run with -- --ignored and AI_SDK_GATEWAY_* env set"]
 async fn structured_json_object_output() {
     let gateway = gateway_from_env();
     if !gateway_available(&gateway) {
@@ -471,6 +490,7 @@ async fn structured_json_object_output() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[ignore = "live gateway suite: real HTTP calls; run with -- --ignored and AI_SDK_GATEWAY_* env set"]
 async fn vision_model_identifies_red_pixel() {
     let gateway = gateway_from_env();
     if !gateway_available(&gateway) {
@@ -516,6 +536,7 @@ async fn vision_model_identifies_red_pixel() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[ignore = "live gateway suite: real HTTP calls; run with -- --ignored and AI_SDK_GATEWAY_* env set"]
 async fn invalid_api_key_returns_authentication_error() {
     let gateway = gateway_from_env();
     if !gateway_available(&gateway) {
@@ -555,6 +576,7 @@ async fn invalid_api_key_returns_authentication_error() {
 /// the observed contract and documents the quirk; if the gateway later
 /// distinguishes the status codes, this test must be updated.
 #[tokio::test]
+#[ignore = "live gateway suite: real HTTP calls; run with -- --ignored and AI_SDK_GATEWAY_* env set"]
 async fn unknown_model_returns_typed_error() {
     let gateway = gateway_from_env();
     if !gateway_available(&gateway) {
@@ -589,6 +611,7 @@ async fn unknown_model_returns_typed_error() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[ignore = "live gateway suite: real HTTP calls; run with -- --ignored and AI_SDK_GATEWAY_* env set"]
 async fn parallel_calls_both_models_concurrently() {
     let gateway = gateway_from_env();
     if !gateway_available(&gateway) {
@@ -752,6 +775,7 @@ impl ExprParser {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[ignore = "live gateway suite: real HTTP calls; run with -- --ignored and AI_SDK_GATEWAY_* env set"]
 async fn agent_tool_loop_live_primary_model() {
     let gateway = gateway_from_env();
     if !gateway_available(&gateway) {
@@ -815,6 +839,7 @@ async fn agent_tool_loop_live_primary_model() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[ignore = "live gateway suite: real HTTP calls; run with -- --ignored and AI_SDK_GATEWAY_* env set"]
 async fn rag_self_hosted_live_answer_from_retrieved_context() {
     let gateway = gateway_from_env();
     if !gateway_available(&gateway) {
@@ -885,6 +910,7 @@ async fn rag_self_hosted_live_answer_from_retrieved_context() {
 }
 
 #[tokio::test]
+#[ignore = "live gateway suite: real HTTP calls; run with -- --ignored and AI_SDK_GATEWAY_* env set"]
 async fn semantic_memory_self_hosted_live() {
     let gateway = gateway_from_env();
     if !gateway_available(&gateway) {

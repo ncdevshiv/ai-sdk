@@ -68,5 +68,5 @@ jobs:
         if: env.AI_SDK_GATEWAY_API_KEY != ''
       - uses: dtolnay/rust-toolchain@stable
         if: env.AI_SDK_GATEWAY_API_KEY != ''
-      - run: cargo test -p ai-providers --test live_gateway -- --test-threads=2
+      - run: cargo test -p ai-providers --test live_gateway -- --ignored --test-threads=2
         if: env.AI_SDK_GATEWAY_API_KEY != ''
