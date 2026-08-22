@@ -29,6 +29,13 @@ impl From<EmbeddingsError> for AiError {
 #[async_trait]
 pub trait EmbeddingsProvider: Send + Sync {
     async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingsError>;
+
+    /// Feeds texts to the provider *before* they are embedded so stateful
+    /// providers can learn from them (e.g. [`crate::NgramEmbeddings`]
+    /// accumulates online document frequencies for idf weighting). Called
+    /// by ingest paths such as the RAG pipeline. Default: no-op, which is
+    /// exactly right for stateless providers.
+    async fn observe(&self, _texts: &[String]) {}
 }
 
 /// Real OpenAI-compatible embeddings adapter (`POST {base}/embeddings`).

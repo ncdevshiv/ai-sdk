@@ -19,3 +19,9 @@ tokio.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
 parking_lot.workspace = true
+async-trait.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+futures-core.workspace = true
+ai-types = { path = "../ai-types" }

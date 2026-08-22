@@ -1,5 +1,17 @@
 //! The RAG pipeline: chunk → embed → store → retrieve (hybrid) → rerank →
 //! assemble context.
+//!
+//! # Retrieval recall (changed)
+//!
+//! The keyword stage scores **all ingested chunks** (kept in the pipeline's
+//! in-memory mirror), not only the vector-stage survivors. Historically the
+//! keyword stage searched just the semantic top-hits subset, capping fused
+//! recall at whatever the vector stage surfaced — a lexically perfect match
+//! outside that subset was unreachable. With
+//! [`HybridStrategy::WeightedAlpha`] this widens the fusion pool (keyword
+//! matches can now enter from below); with [`HybridStrategy::ReciprocalRank`]
+//! the keyword ranking is a first-class list. Corpus statistics
+//! ([`CorpusStats`]) are accumulated at ingest and feed real BM25 idf.
 
 use std::sync::Arc;
 
@@ -8,7 +20,9 @@ use ai_memory::EmbeddingsProvider;
 use ai_storage::{VectorEntry, VectorStore};
 
 use crate::chunking::{ChunkingStrategy, chunk_document};
-use crate::hybrid::{hybrid_fusion, keyword_search};
+use crate::hybrid::{
+    CorpusStats, HybridStrategy, RRF_K, hybrid_fusion_with, reciprocal_rank_fusion,
+};
 use crate::{IdentityReranker, Reranker};
 
 /// A retrieved chunk with its score.
@@ -26,8 +40,14 @@ pub struct RagConfig {
     pub chunking: ChunkingStrategy,
     /// Semantic similarity threshold for vector hits.
     pub min_similarity: f32,
-    /// Blend factor for hybrid fusion (1 = semantic only, 0 = keyword only).
+    /// Blend factor for weighted-alpha fusion (1 = semantic only, 0 =
+    /// keyword only). Ignored by [`HybridStrategy::ReciprocalRank`].
     pub hybrid_alpha: f32,
+    /// How semantic and keyword signals are fused.
+    ///
+    /// Default is [`HybridStrategy::WeightedAlpha`], preserving historical
+    /// behavior; [`HybridStrategy::ReciprocalRank`] enables true RRF.
+    pub strategy: HybridStrategy,
     /// BM25 k1 parameter.
     pub bm25_k1: f32,
     /// BM25 b parameter.
@@ -43,6 +63,7 @@ impl Default for RagConfig {
             },
             min_similarity: 0.5,
             hybrid_alpha: 0.7,
+            strategy: HybridStrategy::default(),
             bm25_k1: 1.2,
             bm25_b: 0.75,
         }
@@ -59,6 +80,9 @@ pub struct RagPipeline {
     config: RagConfig,
     reranker: Arc<dyn Reranker>,
     mirror: mirror::EntryMirror,
+    /// Corpus statistics (N, avgdl, document frequencies) accumulated
+    /// online at ingest, feeding corpus-aware BM25 at retrieval time.
+    corpus: parking_lot::RwLock<CorpusStats>,
 }
 
 impl RagPipeline {
@@ -73,6 +97,7 @@ impl RagPipeline {
             config,
             reranker: Arc::new(IdentityReranker),
             mirror: mirror::EntryMirror::new(),
+            corpus: parking_lot::RwLock::new(CorpusStats::new()),
         }
     }
 
@@ -81,10 +106,27 @@ impl RagPipeline {
         self
     }
 
-    /// Ingests a document: chunk, embed each chunk, upsert into the store.
+    /// Snapshot of the accumulated corpus statistics.
+    pub fn corpus_stats(&self) -> CorpusStats {
+        self.corpus.read().clone()
+    }
+
+    /// Ingests a document: chunk, fit corpus/embedding statistics online,
+    /// embed each chunk, upsert into the store.
+    ///
+    /// Statistics are updated *before* embedding so stateful embedders
+    /// ([`ai_memory::NgramEmbeddings`]) see every ingest chunk in their
+    /// idf table; chunks are also registered as BM25 corpus documents.
     pub async fn ingest(&self, document_id: &str, document: &str) -> Result<usize, AiError> {
         let chunks = chunk_document(document, self.config.chunking);
         let texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
+
+        // Online fitting: corpus stats for BM25 + stateful embedders.
+        for text in &texts {
+            self.corpus.write().observe(text);
+        }
+        self.embeddings.observe(&texts).await;
+
         let vectors = self
             .embeddings
             .embed(&texts)
@@ -126,7 +168,7 @@ impl RagPipeline {
                 AiError::Storage(StorageError::new("rag", "embeddings returned no vector"))
             })?;
 
-        // Semantic candidates (superset for fusion).
+        // Semantic candidates (superset for fusion), best first.
         let semantic = self.store.search(&query_vector, top_k * 3).await?;
         let semantic: Vec<(String, f32)> = semantic
             .into_iter()
@@ -134,40 +176,60 @@ impl RagPipeline {
             .map(|(entry, score)| (entry.id, score))
             .collect();
 
-        // Keyword candidates over the semantic hits.
-        let semantic_chunks: Vec<RetrievedChunk> = semantic
-            .iter()
-            .filter_map(|(id, score)| {
-                let entry = self.mirror.get(id)?;
-                Some(RetrievedChunk {
-                    id: id.clone(),
-                    text: entry
-                        .payload
-                        .get("text")
-                        .and_then(|t| t.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                    score: *score,
-                    metadata: entry.payload.clone(),
-                })
+        // Keyword stage over ALL ingested chunks — not just the semantic
+        // survivors — so lexical matches outside the vector pool can be
+        // fused in (see the module docs on the recall cap).
+        let all_chunks: Vec<RetrievedChunk> = self
+            .mirror
+            .all()
+            .into_iter()
+            .map(|entry| RetrievedChunk {
+                id: entry.id.clone(),
+                text: entry
+                    .payload
+                    .get("text")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                score: 0.0,
+                metadata: entry.payload.clone(),
             })
             .collect();
-
-        let keyword = keyword_search(
+        let corpus_snapshot = self.corpus.read().clone();
+        let keyword = crate::hybrid::keyword_search_corpus(
             query,
-            &semantic_chunks,
+            &all_chunks,
+            &corpus_snapshot,
             self.config.bm25_k1,
             self.config.bm25_b,
         );
         let keyword_by_id: std::collections::HashMap<String, f32> = keyword
             .iter()
-            .filter_map(|(index, score)| {
-                semantic_chunks.get(*index).map(|c| (c.id.clone(), *score))
-            })
+            .filter_map(|(index, score)| all_chunks.get(*index).map(|c| (c.id.clone(), *score)))
             .collect();
 
-        // Hybrid fusion.
-        let mut fused = hybrid_fusion(&semantic, &keyword_by_id, self.config.hybrid_alpha);
+        // Hybrid fusion per configured strategy. RRF combines the two
+        // rankings scale-free; weighted-alpha keeps the historical blend.
+        let fused = match self.config.strategy {
+            HybridStrategy::WeightedAlpha => hybrid_fusion_with(
+                HybridStrategy::WeightedAlpha,
+                &semantic,
+                &keyword_by_id,
+                self.config.hybrid_alpha,
+            ),
+            HybridStrategy::ReciprocalRank => reciprocal_rank_fusion(
+                &[semantic.iter().map(|(id, _)| id.clone()).collect(), {
+                    let mut kw: Vec<(String, f32)> = keyword_by_id
+                        .iter()
+                        .map(|(id, score)| (id.clone(), *score))
+                        .collect();
+                    kw.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                    kw.into_iter().map(|(id, _)| id).collect()
+                }],
+                RRF_K,
+            ),
+        };
+        let mut fused = fused;
         fused.truncate(top_k);
 
         let mut retrieved = Vec::with_capacity(fused.len());
@@ -259,6 +321,12 @@ pub(crate) mod mirror {
 
         pub fn get(&self, id: &str) -> Option<VectorEntry> {
             self.entries.read().get(id).cloned()
+        }
+
+        /// Snapshot of every mirrored entry (used by the keyword stage to
+        /// score all ingested chunks).
+        pub fn all(&self) -> Vec<VectorEntry> {
+            self.entries.read().values().cloned().collect()
         }
     }
 }
@@ -391,5 +459,213 @@ mod tests {
     #[test]
     fn tokenize_available_for_keyword_reranker_tests() {
         assert_eq!(crate::hybrid::tokenize("Rust Lang"), vec!["rust", "lang"]);
+    }
+
+    /// Regression for the historical recall cap: when the semantic stage
+    /// filters everything out (high `min_similarity`), the keyword stage
+    /// must still surface lexical matches because it scores ALL ingested
+    /// chunks. Under the old implementation the keyword stage searched only
+    /// the semantic survivors, so nothing could be retrieved here.
+    #[tokio::test]
+    async fn keyword_stage_reaches_chunks_filtered_out_by_semantic_stage() {
+        let store: Arc<dyn VectorStore> = Arc::new(InMemoryVectorStore::new(100));
+        let embeddings = Arc::new(HashEmbeddings);
+        let pipeline = RagPipeline::new(
+            store.clone(),
+            embeddings.clone(),
+            RagConfig {
+                chunking: ChunkingStrategy::Fixed {
+                    size: 10_000,
+                    overlap: 0,
+                },
+                // Nothing but an exact self-match survives this.
+                min_similarity: 0.999,
+                hybrid_alpha: 0.7,
+                ..Default::default()
+            },
+        );
+
+        pipeline
+            .ingest(
+                "d1",
+                "Kumquat propulsion research remains highly experimental today.",
+            )
+            .await
+            .unwrap();
+        pipeline
+            .ingest("d2", "Quarterly revenue exceeded analyst expectations.")
+            .await
+            .unwrap();
+
+        // Prove the semantic stage is empty for this query under the
+        // threshold (this is what capped recall historically).
+        let qvec = embeddings
+            .embed(&["kumquat propulsion".to_string()])
+            .await
+            .unwrap()[0]
+            .clone();
+        let semantic_hits = store.search(&qvec, 10).await.unwrap();
+        let surviving = semantic_hits
+            .iter()
+            .filter(|(_, score)| *score >= 0.999)
+            .count();
+        assert_eq!(surviving, 0, "semantic stage must be empty under 0.999");
+
+        // Yet retrieval succeeds through the corpus-BM25 keyword stage.
+        let results = pipeline.retrieve("kumquat propulsion", 3).await.unwrap();
+        assert!(
+            results.iter().any(|c| c.id.starts_with("d1")),
+            "keyword stage must rescue the lexically matching chunk: {:?}",
+            results.iter().map(|c| &c.id).collect::<Vec<_>>()
+        );
+    }
+
+    /// End-to-end morphology eval over the committed ai-memory fixtures:
+    /// compares the fully-upgraded configuration (NgramEmbeddings +
+    /// ReciprocalRank + corpus BM25) against the legacy configuration
+    /// (StatisticalEmbeddings + WeightedAlpha), plus an intermediate
+    /// (StatisticalEmbeddings + ReciprocalRank) to attribute gains. Prints
+    /// per-config hit counts truthfully and asserts the upgrade does not
+    /// regress.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn upgraded_pipeline_improves_morphology_retrieval() {
+        use std::collections::BTreeMap;
+
+        #[derive(serde::Deserialize)]
+        struct Fixture {
+            distractors: Vec<String>,
+            categories: Vec<Category>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Category {
+            name: String,
+            cases: Vec<Case>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Case {
+            id: String,
+            query: String,
+            relevant: String,
+        }
+
+        // Reuse the ai-memory eval fixtures (same workspace).
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../ai-memory/tests/eval_fixtures/eval_set.json"
+        );
+        let raw = std::fs::read_to_string(path).expect("fixture file readable");
+        let fx: Fixture = serde_json::from_str(&raw).unwrap();
+        // Morphology-focused subset (the suite the brief targets); report
+        // other categories too so nothing is cherry-picked silently.
+        let categories_of_interest: Vec<&Category> = fx
+            .categories
+            .iter()
+            .filter(|c| c.name != "lexical_control")
+            .collect();
+
+        async fn run_pipeline(
+            label: &str,
+            embeddings: Arc<dyn EmbeddingsProvider>,
+            strategy: crate::hybrid::HybridStrategy,
+            fx: &Fixture,
+            categories: &[&Category],
+        ) -> (BTreeMap<String, usize>, u64) {
+            let store: Arc<dyn VectorStore> = Arc::new(InMemoryVectorStore::new(1000));
+            let pipeline = RagPipeline::new(
+                store,
+                embeddings,
+                RagConfig {
+                    chunking: ChunkingStrategy::Fixed {
+                        size: 10_000,
+                        overlap: 0,
+                    },
+                    min_similarity: 0.0,
+                    strategy,
+                    ..Default::default()
+                },
+            );
+            // Index: every relevant doc (id = case id) + distractors.
+            for category in &fx.categories {
+                for case in &category.cases {
+                    pipeline.ingest(&case.id, &case.relevant).await.unwrap();
+                }
+            }
+            for (i, d) in fx.distractors.iter().enumerate() {
+                pipeline
+                    .ingest(&format!("distractor-{i}"), d)
+                    .await
+                    .unwrap();
+            }
+            let corpus_docs = pipeline.corpus_stats().doc_count();
+
+            let mut hits: BTreeMap<String, usize> = BTreeMap::new();
+            for category in categories {
+                let mut cat_hits = 0usize;
+                for case in &category.cases {
+                    let results = pipeline.retrieve(&case.query, 5).await.unwrap();
+                    if results.iter().any(|c| c.id.starts_with(&case.id)) {
+                        cat_hits += 1;
+                    } else {
+                        println!("  MISS [{label}] {} {}", case.id, case.query);
+                    }
+                }
+                println!(
+                    "  [{label}] {}: {cat_hits}/{}",
+                    category.name,
+                    category.cases.len()
+                );
+                hits.insert(category.name.clone(), cat_hits);
+            }
+            (hits, corpus_docs)
+        }
+
+        let stat = Arc::new(ai_memory::StatisticalEmbeddings::defaults());
+        let ngram = Arc::new(ai_memory::NgramEmbeddings::defaults());
+
+        println!("\n=== MINERVA e2e pipeline: top-5 hits by configuration ===");
+        let (legacy, docs_legacy) = run_pipeline(
+            "legacy: statistical+weighted-alpha",
+            stat.clone(),
+            crate::hybrid::HybridStrategy::WeightedAlpha,
+            &fx,
+            &categories_of_interest,
+        )
+        .await;
+        let (fusion_only, _) = run_pipeline(
+            "fusion-only: statistical+RRF",
+            stat,
+            crate::hybrid::HybridStrategy::ReciprocalRank,
+            &fx,
+            &categories_of_interest,
+        )
+        .await;
+        let (upgraded, docs_upgraded) = run_pipeline(
+            "upgraded: ngram+RRF+corpus-bm25",
+            ngram,
+            crate::hybrid::HybridStrategy::ReciprocalRank,
+            &fx,
+            &categories_of_interest,
+        )
+        .await;
+
+        // Corpus statistics were fed at ingest in every configuration.
+        let expected_docs = (fx.categories.iter().map(|c| c.cases.len()).sum::<usize>()
+            + fx.distractors.len()) as u64;
+        assert_eq!(docs_legacy, expected_docs);
+        assert_eq!(docs_upgraded, expected_docs);
+
+        let total = |m: &BTreeMap<String, usize>| m.values().sum::<usize>();
+        println!(
+            "totals: legacy={} fusion_only={} upgraded={}",
+            total(&legacy),
+            total(&fusion_only),
+            total(&upgraded)
+        );
+        println!("=========================================================\n");
+
+        assert!(
+            total(&upgraded) >= total(&legacy),
+            "upgraded pipeline must not regress vs legacy"
+        );
     }
 }

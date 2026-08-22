@@ -250,8 +250,16 @@ impl UrlPolicy {
             }
         }
 
-        // Private/reserved ranges for literal IPs.
+        // Private/reserved ranges for literal IPs and well-known local hostnames.
         if !self.allow_private {
+            if host == "localhost"
+                || host == "0"
+                || host.ends_with(".localhost")
+                || host.ends_with(".local")
+                || host.ends_with(".internal")
+            {
+                return UrlVerdict::Rejected(format!("private host `{host}` not allowed"));
+            }
             if let Ok(ip) = host.parse::<IpAddr>() {
                 let blocked = match ip {
                     IpAddr::V4(v4) => {
@@ -259,6 +267,8 @@ impl UrlPolicy {
                             || v4.is_loopback()
                             || v4.is_link_local()
                             || v4.is_unspecified()
+                            || v4.is_broadcast()
+                            || v4.is_documentation()
                     }
                     IpAddr::V6(v6) => {
                         v6.is_loopback() || v6.is_unspecified() || v6.is_unique_local()
@@ -392,3 +402,6 @@ mod tests {
         assert!(!Permissions::new().permits("anything"));
     }
 }
+
+#[cfg(test)]
+mod proptests;

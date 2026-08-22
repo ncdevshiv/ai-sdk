@@ -1,13 +1,22 @@
 //! Four-tier memory (PRD §3.4): working, short-term, long-term, and
 //! semantic memory behind pluggable storage. Compaction/summarization is
 //! driven by a caller-provided summarizer (e.g. an LLM via the gateway).
+//!
+//! Embeddings providers: [`StatisticalEmbeddings`] (word-level feature
+//! hashing baseline) and [`NgramEmbeddings`] (character 2..=4-gram hashing
+//! with online idf; robust to morphology, typos, and OOV words). Both
+//! implement [`EmbeddingsProvider`] and are interchangeable everywhere;
+//! ingest paths call [`EmbeddingsProvider::observe`] so stateful providers
+//! can fit corpus statistics online.
 
 mod embeddings;
+mod ngram;
 mod semantic;
 mod statistical;
 mod working;
 
 pub use embeddings::{EmbeddingsError, EmbeddingsProvider, OpenAiCompatEmbeddings};
+pub use ngram::{NgramConfig, NgramEmbeddings};
 pub use semantic::{SemanticFact, SemanticMemory, SemanticMemoryConfig};
 pub use statistical::{StatisticalConfig, StatisticalEmbeddings};
 pub use working::{CompactionStrategy, WorkingMemory};
@@ -305,3 +314,6 @@ mod tests {
         assert!(history.len() <= 6, "bounded: {}", history.len());
     }
 }
+
+#[cfg(test)]
+mod proptests;

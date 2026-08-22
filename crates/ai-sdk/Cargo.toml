@@ -34,6 +34,7 @@ ai-storage = { path = "../ai-storage" }
 ai-edge = { path = "../ai-edge" }
 ai-voice = { path = "../ai-voice" }
 ai-cli = { path = "../ai-cli" }
+ai-orchestra = { path = "../ai-orchestra" }
 ai-errors = { path = "../ai-errors" }
 tokio.workspace = true
 serde_json.workspace = true

@@ -19,7 +19,9 @@ use ai_types::{
     Completion, ContentPart, Message, ModelId, ProviderId, Role, StreamEvent, ToolCall, Usage,
 };
 
-use crate::http::{HttpClient, map_reqwest_error, map_response_error, parse_json};
+use crate::http::{
+    HttpClient, map_reqwest_error, map_response_error, parse_json, retry_after_from_headers,
+};
 
 /// Configuration for the Gemini provider.
 #[derive(Debug, Clone)]
@@ -71,7 +73,7 @@ impl GeminiProvider {
     pub fn new(config: GeminiConfig) -> Result<Self, AiError> {
         Ok(Self {
             config,
-            http: HttpClient::new()?,
+            http: HttpClient::shared(),
         })
     }
 
@@ -391,14 +393,14 @@ impl Provider for GeminiProvider {
     async fn list_models(&self) -> Result<Vec<ModelInfo>, AiError> {
         let response = tokio::time::timeout(
             self.config.timeout,
-            self.http
-                .inner()
-                .get(format!(
-                    "{}/models",
-                    self.config.base_url.trim_end_matches('/')
-                ))
-                .header("x-goog-api-key", &self.config.api_key)
-                .send(),
+            self.http.execute(
+                self.http
+                    .get(format!(
+                        "{}/models",
+                        self.config.base_url.trim_end_matches('/')
+                    ))
+                    .header("x-goog-api-key", &self.config.api_key),
+            ),
         )
         .await
         .map_err(|_| {
@@ -410,13 +412,14 @@ impl Provider for GeminiProvider {
         .map_err(|e| map_reqwest_error("google.models", e))?;
 
         let status = response.status();
+        let retry_after = retry_after_from_headers(response.headers());
         let bytes = response
             .bytes()
             .await
             .map_err(|e| map_reqwest_error("google.models", e))?
             .to_vec();
         if !status.is_success() {
-            return Err(map_response_error("google", status, &bytes).await);
+            return Err(map_response_error("google", status, retry_after, &bytes).await);
         }
         let json: Value = parse_json("google.models", &bytes)?;
         let models = json
@@ -513,13 +516,13 @@ impl Model for GeminiModel {
         let body = build_generate_body(&request)?;
         let response = tokio::time::timeout(
             self.provider.config.timeout,
-            self.provider
-                .http
-                .inner()
-                .post(self.provider.url(self.info.id.as_str(), false))
-                .header("x-goog-api-key", &self.provider.config.api_key)
-                .json(&body)
-                .send(),
+            self.provider.http.execute(
+                self.provider
+                    .http
+                    .post(self.provider.url(self.info.id.as_str(), false))
+                    .header("x-goog-api-key", &self.provider.config.api_key)
+                    .json(&body),
+            ),
         )
         .await
         .map_err(|_| {
@@ -531,13 +534,14 @@ impl Model for GeminiModel {
         .map_err(|e| map_reqwest_error("google.generate", e))?;
 
         let status = response.status();
+        let retry_after = retry_after_from_headers(response.headers());
         let bytes = response
             .bytes()
             .await
             .map_err(|e| map_reqwest_error("google.generate", e))?
             .to_vec();
         if !status.is_success() {
-            return Err(map_response_error("google", status, &bytes).await);
+            return Err(map_response_error("google", status, retry_after, &bytes).await);
         }
         let json: Value = parse_json("google.generate", &bytes)?;
         parse_generate_response(&self.info.provider, &self.info.id, &json)
@@ -547,13 +551,13 @@ impl Model for GeminiModel {
         let body = build_generate_body(&request)?;
         let response = tokio::time::timeout(
             self.provider.config.timeout,
-            self.provider
-                .http
-                .inner()
-                .post(self.provider.url(self.info.id.as_str(), true))
-                .header("x-goog-api-key", &self.provider.config.api_key)
-                .json(&body)
-                .send(),
+            self.provider.http.execute(
+                self.provider
+                    .http
+                    .post(self.provider.url(self.info.id.as_str(), true))
+                    .header("x-goog-api-key", &self.provider.config.api_key)
+                    .json(&body),
+            ),
         )
         .await
         .map_err(|_| {
@@ -565,13 +569,14 @@ impl Model for GeminiModel {
         .map_err(|e| map_reqwest_error("google.stream", e))?;
 
         let status = response.status();
+        let retry_after = retry_after_from_headers(response.headers());
         if !status.is_success() {
             let bytes = response
                 .bytes()
                 .await
                 .map_err(|e| map_reqwest_error("google.stream", e))?
                 .to_vec();
-            return Err(map_response_error("google", status, &bytes).await);
+            return Err(map_response_error("google", status, retry_after, &bytes).await);
         }
         let operation = "google.stream".to_string();
         let byte_stream = response

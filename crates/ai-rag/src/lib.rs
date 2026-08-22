@@ -1,14 +1,20 @@
 //! RAG (PRD §3.8): chunking, ingestion, vector retrieval, hybrid
 //! keyword+semantic search, reranking, and context assembly. Storage and
 //! embeddings are real (`ai-storage` vector store, `ai-memory` embeddings
-//! provider); the keyword scorer is a real BM25-style implementation.
+//! provider). Keyword scoring is true BM25 with corpus idf when statistics
+//! have been accumulated at ingest (falling back to constant-idf scoring
+//! otherwise), and fusion offers weighted-alpha blending plus genuine
+//! reciprocal rank fusion (`HybridStrategy::ReciprocalRank`).
 
 mod chunking;
 mod hybrid;
 mod pipeline;
 
 pub use chunking::{ChunkingStrategy, chunk_document};
-pub use hybrid::{bm25_score, cosine, keyword_search};
+pub use hybrid::{
+    CorpusStats, HybridStrategy, RRF_K, bm25_corpus, bm25_score, cosine, hybrid_fusion,
+    hybrid_fusion_with, keyword_search, keyword_search_corpus, reciprocal_rank_fusion,
+};
 pub use pipeline::{ContextAssembler, RagConfig, RagPipeline, RetrievedChunk};
 
 use ai_errors::AiError;
@@ -101,3 +107,6 @@ mod tests {
         assert_eq!(out[0].id, "a");
     }
 }
+
+#[cfg(test)]
+mod proptests;

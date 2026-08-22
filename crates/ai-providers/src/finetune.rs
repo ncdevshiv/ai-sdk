@@ -12,7 +12,9 @@ use serde::{Deserialize, Serialize};
 
 use ai_errors::{AiError, SerializationError, TimeoutError};
 
-use crate::http::{HttpClient, map_reqwest_error, map_response_error, parse_json};
+use crate::http::{
+    HttpClient, map_reqwest_error, map_response_error, parse_json, retry_after_from_headers,
+};
 
 /// A fine-tuning job (OpenAI wire shape).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,7 +83,7 @@ impl FineTuningClient {
         Ok(Self {
             base_url: base_url.into(),
             api_key: api_key.into(),
-            http: HttpClient::new()?,
+            http: HttpClient::shared(),
             timeout: Duration::from_secs(60),
         })
     }
@@ -94,22 +96,20 @@ impl FineTuningClient {
         let response = tokio::time::timeout(
             self.timeout,
             self.http
-                .inner()
-                .get(self.url(path))
-                .bearer_auth(&self.api_key)
-                .send(),
+                .execute(self.http.get(self.url(path)).bearer_auth(&self.api_key)),
         )
         .await
         .map_err(|_| TimeoutError::new("finetune.get", self.timeout))?
         .map_err(|e| map_reqwest_error("finetune.get", e))?;
         let status = response.status();
+        let retry_after = retry_after_from_headers(response.headers());
         let bytes = response
             .bytes()
             .await
             .map_err(|e| map_reqwest_error("finetune.get", e))?
             .to_vec();
         if !status.is_success() {
-            return Err(map_response_error("openai", status, &bytes).await);
+            return Err(map_response_error("openai", status, retry_after, &bytes).await);
         }
         parse_json("finetune.get", &bytes)
     }
@@ -117,24 +117,25 @@ impl FineTuningClient {
     async fn post(&self, path: &str, body: Value) -> Result<Value, AiError> {
         let response = tokio::time::timeout(
             self.timeout,
-            self.http
-                .inner()
-                .post(self.url(path))
-                .bearer_auth(&self.api_key)
-                .json(&body)
-                .send(),
+            self.http.execute(
+                self.http
+                    .post(self.url(path))
+                    .bearer_auth(&self.api_key)
+                    .json(&body),
+            ),
         )
         .await
         .map_err(|_| TimeoutError::new("finetune.post", self.timeout))?
         .map_err(|e| map_reqwest_error("finetune.post", e))?;
         let status = response.status();
+        let retry_after = retry_after_from_headers(response.headers());
         let bytes = response
             .bytes()
             .await
             .map_err(|e| map_reqwest_error("finetune.post", e))?
             .to_vec();
         if !status.is_success() {
-            return Err(map_response_error("openai", status, &bytes).await);
+            return Err(map_response_error("openai", status, retry_after, &bytes).await);
         }
         parse_json("finetune.post", &bytes)
     }
@@ -147,39 +148,40 @@ impl FineTuningClient {
     ) -> Result<String, AiError> {
         let response = tokio::time::timeout(
             self.timeout,
-            self.http
-                .inner()
-                .post(self.url("files"))
-                .bearer_auth(&self.api_key)
-                .multipart(
-                    reqwest::multipart::Form::new()
-                        .text("purpose", "fine-tune".to_string())
-                        .part(
-                            "file",
-                            reqwest::multipart::Part::bytes(jsonl.as_bytes().to_vec())
-                                .file_name(filename.to_string())
-                                .mime_str("application/jsonl")
-                                .map_err(|e| {
-                                    AiError::Web(ai_errors::WebError::new(
-                                        "finetune.upload",
-                                        e.to_string(),
-                                    ))
-                                })?,
-                        ),
-                )
-                .send(),
+            self.http.execute(
+                self.http
+                    .post(self.url("files"))
+                    .bearer_auth(&self.api_key)
+                    .multipart(
+                        reqwest::multipart::Form::new()
+                            .text("purpose", "fine-tune".to_string())
+                            .part(
+                                "file",
+                                reqwest::multipart::Part::bytes(jsonl.as_bytes().to_vec())
+                                    .file_name(filename.to_string())
+                                    .mime_str("application/jsonl")
+                                    .map_err(|e| {
+                                        AiError::Web(ai_errors::WebError::new(
+                                            "finetune.upload",
+                                            e.to_string(),
+                                        ))
+                                    })?,
+                            ),
+                    ),
+            ),
         )
         .await
         .map_err(|_| TimeoutError::new("finetune.upload", self.timeout))?
         .map_err(|e| map_reqwest_error("finetune.upload", e))?;
         let status = response.status();
+        let retry_after = retry_after_from_headers(response.headers());
         let bytes = response
             .bytes()
             .await
             .map_err(|e| map_reqwest_error("finetune.upload", e))?
             .to_vec();
         if !status.is_success() {
-            return Err(map_response_error("openai", status, &bytes).await);
+            return Err(map_response_error("openai", status, retry_after, &bytes).await);
         }
         let json: Value = parse_json("finetune.upload", &bytes)?;
         json.get("id")

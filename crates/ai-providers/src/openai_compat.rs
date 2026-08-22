@@ -11,6 +11,7 @@
 //!   `completion_tokens_details.reasoning_tokens`) → [`ai_types::Usage`]
 //! - Gateway `cost` field → preserved in [`Completion::raw`]
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -27,7 +28,9 @@ use ai_types::{
     Usage,
 };
 
-use crate::http::{HttpClient, map_reqwest_error, map_response_error, parse_json};
+use crate::http::{
+    HttpClient, map_reqwest_error, map_response_error, parse_json, retry_after_from_headers,
+};
 
 /// Well-known default base URLs per provider id.
 fn default_base_url(provider: &str) -> Option<&'static str> {
@@ -109,7 +112,7 @@ impl std::fmt::Debug for OpenAiCompatProvider {
 
 impl OpenAiCompatProvider {
     pub fn new(config: OpenAiCompatConfig) -> Result<Self, AiError> {
-        let http = HttpClient::new()?;
+        let http = HttpClient::shared();
         Ok(Self {
             config,
             http,
@@ -136,12 +139,12 @@ impl OpenAiCompatProvider {
         let operation = format!("{}.{}", self.config.provider_id, path);
         let response = tokio::time::timeout(
             self.config.timeout,
-            self.http
-                .inner()
-                .post(self.url(path))
-                .bearer_auth(&self.config.api_key)
-                .json(&body)
-                .send(),
+            self.http.execute(
+                self.http
+                    .post(self.url(path))
+                    .bearer_auth(&self.config.api_key)
+                    .json(&body),
+            ),
         )
         .await
         .map_err(|_| {
@@ -151,8 +154,13 @@ impl OpenAiCompatProvider {
             ))
         })?
         .map_err(|e| map_reqwest_error(&operation, e))?;
+        if std::env::var("AI_SDK_DEBUG_WIRE").as_deref() == Ok("1") {
+            let path = std::env::temp_dir().join("dsh-wire-debug.json");
+            let _ = std::fs::write(&path, body.to_string());
+        }
 
         let status = response.status();
+        let retry_after = retry_after_from_headers(response.headers());
         let bytes = response
             .bytes()
             .await
@@ -160,7 +168,9 @@ impl OpenAiCompatProvider {
             .to_vec();
 
         if !status.is_success() {
-            return Err(map_response_error(&self.config.provider_id, status, &bytes).await);
+            return Err(
+                map_response_error(&self.config.provider_id, status, retry_after, &bytes).await,
+            );
         }
         parse_json(&operation, &bytes)
     }
@@ -170,12 +180,12 @@ impl OpenAiCompatProvider {
         let operation = format!("{}.{}", self.config.provider_id, path);
         let response = tokio::time::timeout(
             self.config.timeout,
-            self.http
-                .inner()
-                .post(self.url(path))
-                .bearer_auth(&self.config.api_key)
-                .json(&body)
-                .send(),
+            self.http.execute(
+                self.http
+                    .post(self.url(path))
+                    .bearer_auth(&self.config.api_key)
+                    .json(&body),
+            ),
         )
         .await
         .map_err(|_| {
@@ -187,13 +197,16 @@ impl OpenAiCompatProvider {
         .map_err(|e| map_reqwest_error(&operation, e))?;
 
         let status = response.status();
+        let retry_after = retry_after_from_headers(response.headers());
         if !status.is_success() {
             let bytes = response
                 .bytes()
                 .await
                 .map_err(|e| map_reqwest_error(&operation, e))?
                 .to_vec();
-            return Err(map_response_error(&self.config.provider_id, status, &bytes).await);
+            return Err(
+                map_response_error(&self.config.provider_id, status, retry_after, &bytes).await,
+            );
         }
 
         // reqwest's byte stream → SSE events → unified stream events.
@@ -203,6 +216,47 @@ impl OpenAiCompatProvider {
             .map(move |item| item.map_err(|e| map_reqwest_error(&operation_stream, e)));
         let sse = sse_parse(byte_stream);
         Ok(map_sse_to_events(sse))
+    }
+}
+
+/// Per-stream bookkeeping for OpenAI tool-call fragments.
+///
+/// The wire format announces each tool call on its first delta chunk with
+/// `id` + `function.name`, then continuation chunks carry ONLY `index` +
+/// `function.arguments`. This state maps a fragment's `index` back to the
+/// call id (and name) announced earlier in the same stream, so argument
+/// deltas stay keyed to the call that owns them. When a fragment arrives
+/// with no id and no previously announced id for its index, a stable
+/// placeholder (`call-{index}`) is synthesized — and reused if the name
+/// shows up later — keeping [`ToolCallAccumulator`] keys consistent.
+#[derive(Debug, Default)]
+struct ToolCallStreamState {
+    /// tool-call index → call id announced by the provider (or synthesized).
+    ids: HashMap<u64, String>,
+    /// tool-call index → function name seen for that slot.
+    names: HashMap<u64, String>,
+}
+
+impl ToolCallStreamState {
+    /// Resolves the canonical call id for a fragment at `index`.
+    ///
+    /// Prefers an id announced now or earlier; otherwise synthesizes
+    /// `call-{index}` once and reuses it for subsequent fragments.
+    fn resolve_call_id(&mut self, index: u64, announced: Option<&str>) -> String {
+        if let Some(id) = announced {
+            self.ids.insert(index, id.to_string());
+        }
+        if let Some(id) = self.ids.get(&index) {
+            return id.clone();
+        }
+        let synthesized = format!("call-{index}");
+        self.ids.insert(index, synthesized.clone());
+        synthesized
+    }
+
+    /// True when `name` is the first name observed for `index` (recording it).
+    fn records_first_name(&mut self, index: u64, name: &str) -> bool {
+        self.names.insert(index, name.to_string()).is_none()
     }
 }
 
@@ -216,6 +270,7 @@ impl OpenAiCompatProvider {
 /// `{"choices":[],"cost":"0"}`).
 fn map_sse_to_events(sse: ai_stream::SseStream) -> EventStream {
     let mut accumulator = ToolCallAccumulator::new();
+    let mut tool_state = ToolCallStreamState::default();
     let stream = sse.flat_map(move |sse_result| {
         let mut out: Vec<Result<StreamEvent, AiError>> = Vec::new();
         match sse_result {
@@ -227,7 +282,7 @@ fn map_sse_to_events(sse: ai_stream::SseStream) -> EventStream {
                 match serde_json::from_str::<Value>(&event.data) {
                     Ok(chunk) => {
                         let mut chunk_events = Vec::new();
-                        chunk_to_events(&chunk, &mut chunk_events);
+                        chunk_to_events(&mut tool_state, &chunk, &mut chunk_events);
                         for e in &chunk_events {
                             accumulator.push(e);
                         }
@@ -262,8 +317,10 @@ fn map_sse_to_events(sse: ai_stream::SseStream) -> EventStream {
     Box::pin(stream)
 }
 
-/// Converts one streaming chunk JSON into unified events.
-fn chunk_to_events(chunk: &Value, out: &mut Vec<StreamEvent>) {
+/// Converts one streaming chunk JSON into unified events, resolving
+/// tool-call fragments against the per-stream index→id bookkeeping in
+/// `state`.
+fn chunk_to_events(state: &mut ToolCallStreamState, chunk: &Value, out: &mut Vec<StreamEvent>) {
     let choices = match chunk.get("choices").and_then(|c| c.as_array()) {
         Some(choices) => choices,
         None => return, // e.g. the gateway's trailing {"choices":[],"cost":"0"}
@@ -283,8 +340,14 @@ fn chunk_to_events(chunk: &Value, out: &mut Vec<StreamEvent>) {
         }
     }
 
-    // Reasoning content (DeepSeek-style).
-    if let Some(text) = delta.get("reasoning_content").and_then(|c| c.as_str()) {
+    // Reasoning content: DeepSeek-style `reasoning_content`, with the
+    // OpenRouter/Nous-style `reasoning` key as fallback.
+    if let Some(text) = delta
+        .get("reasoning_content")
+        .and_then(|c| c.as_str())
+        .filter(|s| !s.is_empty())
+        .or_else(|| delta.get("reasoning").and_then(|c| c.as_str()))
+    {
         if !text.is_empty() {
             out.push(StreamEvent::ReasoningDelta {
                 delta: text.to_string(),
@@ -296,26 +359,40 @@ fn chunk_to_events(chunk: &Value, out: &mut Vec<StreamEvent>) {
     if let Some(tool_calls) = delta.get("tool_calls").and_then(|t| t.as_array()) {
         for tc in tool_calls {
             let index = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
-            let id = tc.get("id").and_then(|i| i.as_str());
-            let name = tc.pointer("/function/name").and_then(|n| n.as_str());
+            let id = tc
+                .get("id")
+                .and_then(|i| i.as_str())
+                .filter(|s| !s.is_empty());
+            let name = tc
+                .pointer("/function/name")
+                .and_then(|n| n.as_str())
+                .filter(|s| !s.is_empty());
             let args = tc.pointer("/function/arguments").and_then(|a| a.as_str());
-            let call_id = id.unwrap_or_default();
 
-            if let (Some(id), Some(name)) = (id, name) {
-                out.push(StreamEvent::ToolCallStarted {
-                    id: id.to_string(),
-                    name: name.to_string(),
-                });
+            // Resolve the call id for this slot: announced on this or an
+            // earlier fragment, else synthesized stably from the index.
+            // Continuation chunks carry only `index`, so this lookup is
+            // what keeps argument deltas keyed to the right call.
+            let call_id = state.resolve_call_id(index, id);
+
+            // Emit Started exactly once per index — when the name first
+            // appears — using the same resolved id as the deltas.
+            if let Some(name) = name {
+                if state.records_first_name(index, name) {
+                    out.push(StreamEvent::ToolCallStarted {
+                        id: call_id.clone(),
+                        name: name.to_string(),
+                    });
+                }
             }
             if let Some(args) = args {
                 if !args.is_empty() {
                     out.push(StreamEvent::ToolCallDelta {
-                        id: call_id.to_string(),
+                        id: call_id,
                         arguments_delta: args.to_string(),
                     });
                 }
             }
-            let _ = index;
         }
     }
 
@@ -358,6 +435,19 @@ fn parse_usage(usage: &Value) -> Usage {
 }
 
 /// Serializes a unified [`ChatRequest`] into the OpenAI wire body.
+/// Converts an `f32` sampling parameter to a JSON number without float
+/// widening artifacts: `serde_json` promotes f32 → f64, turning `0.2f32`
+/// into `0.20000000298023224`, which some gateways reject with HTTP 400.
+/// Routing through the shortest decimal representation of the f32 keeps
+/// the wire value clean (`0.2`).
+fn clean_f32(v: f32) -> Value {
+    let s = v.to_string();
+    match s.parse::<f64>() {
+        Ok(clean) => json!(clean),
+        Err(_) => json!(v),
+    }
+}
+
 fn build_chat_body(request: &ChatRequest, model: &str, stream: bool) -> Result<Value, AiError> {
     let mut body = json!({
         "model": model,
@@ -383,16 +473,16 @@ fn build_chat_body(request: &ChatRequest, model: &str, stream: bool) -> Result<V
         body["tools"] = Value::Array(tools);
     }
     if let Some(temperature) = request.temperature {
-        body["temperature"] = json!(temperature);
+        body["temperature"] = clean_f32(temperature);
     }
     if let Some(top_p) = request.top_p {
-        body["top_p"] = json!(top_p);
+        body["top_p"] = clean_f32(top_p);
     }
     if let Some(frequency_penalty) = request.frequency_penalty {
-        body["frequency_penalty"] = json!(frequency_penalty);
+        body["frequency_penalty"] = clean_f32(frequency_penalty);
     }
     if let Some(presence_penalty) = request.presence_penalty {
-        body["presence_penalty"] = json!(presence_penalty);
+        body["presence_penalty"] = clean_f32(presence_penalty);
     }
     if let Some(max_tokens) = request.max_tokens {
         body["max_tokens"] = json!(max_tokens);
@@ -405,12 +495,28 @@ fn build_chat_body(request: &ChatRequest, model: &str, stream: bool) -> Result<V
         ResponseFormat::JsonSchema { schema, name } => {
             body["response_format"] = json!({
                 "type": "json_schema",
-                "json_schema": {"name": name, "schema": schema}
+                "json_schema": {
+                    "name": name,
+                    "schema": schema,
+                    "strict": true
+                }
             });
         }
     }
     if !request.stop.is_empty() {
         body["stop"] = json!(request.stop);
+    }
+    if let Some(reasoning_effort) = request.reasoning_effort {
+        body["reasoning_effort"] = json!(reasoning_effort.to_string());
+    }
+    if let Some(seed) = request.seed {
+        body["seed"] = json!(seed);
+    }
+    if let Some(user) = &request.user {
+        body["user"] = json!(user);
+    }
+    if let Some(parallel_tool_calls) = request.parallel_tool_calls {
+        body["parallel_tool_calls"] = json!(parallel_tool_calls);
     }
     // Merge provider-specific options into the top-level body.
     if let Some(extra) = request.provider_options.as_object() {
@@ -565,10 +671,27 @@ fn parse_completion(
         .and_then(|c| c.as_str())
         .unwrap_or("")
         .to_string();
+    // Reasoning: DeepSeek-style `reasoning_content`, OpenRouter/Nous-style
+    // `reasoning`, then OpenRouter's structured `reasoning_details` array.
     let reasoning = message
         .get("reasoning_content")
         .and_then(|c| c.as_str())
-        .map(|s| s.to_string());
+        .filter(|s| !s.is_empty())
+        .or_else(|| message.get("reasoning").and_then(|c| c.as_str()))
+        .map(|s| s.to_string())
+        .or_else(|| {
+            message
+                .get("reasoning_details")
+                .and_then(|d| d.as_array())
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|i| i.get("text").and_then(|t| t.as_str()))
+                        .collect::<Vec<_>>()
+                        .join("")
+                })
+        })
+        .filter(|s| !s.is_empty());
     let finish_reason = choice
         .get("finish_reason")
         .and_then(|f| f.as_str())
@@ -645,11 +768,11 @@ impl Provider for OpenAiCompatProvider {
         let operation = format!("{}.list_models", self.config.provider_id);
         let response = tokio::time::timeout(
             self.config.timeout,
-            self.http
-                .inner()
-                .get(self.url("models"))
-                .bearer_auth(&self.config.api_key)
-                .send(),
+            self.http.execute(
+                self.http
+                    .get(self.url("models"))
+                    .bearer_auth(&self.config.api_key),
+            ),
         )
         .await
         .map_err(|_| {
@@ -661,13 +784,16 @@ impl Provider for OpenAiCompatProvider {
         .map_err(|e| map_reqwest_error(&operation, e))?;
 
         let status = response.status();
+        let retry_after = retry_after_from_headers(response.headers());
         let bytes = response
             .bytes()
             .await
             .map_err(|e| map_reqwest_error(&operation, e))?
             .to_vec();
         if !status.is_success() {
-            return Err(map_response_error(&self.config.provider_id, status, &bytes).await);
+            return Err(
+                map_response_error(&self.config.provider_id, status, retry_after, &bytes).await,
+            );
         }
 
         let json: Value = parse_json(&operation, &bytes)?;
@@ -833,8 +959,9 @@ mod tests {
             }],
             "usage": null
         });
+        let mut state = ToolCallStreamState::default();
         let mut events = Vec::new();
-        chunk_to_events(&chunk, &mut events);
+        chunk_to_events(&mut state, &chunk, &mut events);
         assert!(matches!(events[0], StreamEvent::TextDelta { ref delta } if delta == "Hello"));
         assert!(
             matches!(events[1], StreamEvent::ReasoningDelta { ref delta } if delta == "thinking")
@@ -858,8 +985,9 @@ mod tests {
             }],
             "usage": null
         });
+        let mut state = ToolCallStreamState::default();
         let mut events = Vec::new();
-        chunk_to_events(&chunk, &mut events);
+        chunk_to_events(&mut state, &chunk, &mut events);
         assert!(matches!(events[0], StreamEvent::ToolCallStarted { ref id, .. } if id == "call_1"));
         assert!(
             matches!(events[1], StreamEvent::ToolCallDelta { ref arguments_delta, .. } if arguments_delta == "{\"e")
@@ -869,9 +997,229 @@ mod tests {
     #[test]
     fn chunk_to_events_ignores_empty_choices_tail() {
         let chunk = json!({"choices": [], "cost": "0"});
+        let mut state = ToolCallStreamState::default();
         let mut events = Vec::new();
-        chunk_to_events(&chunk, &mut events);
+        chunk_to_events(&mut state, &chunk, &mut events);
         assert!(events.is_empty());
+    }
+
+    /// Drives SSE `data:` payloads through the adapter's full mapping path
+    /// (SSE parse → chunk → unified events), like a real streamed response.
+    async fn map_sse_payloads(chunks: &[serde_json::Value]) -> Vec<StreamEvent> {
+        use bytes::Bytes;
+        let body: String = chunks
+            .iter()
+            .map(|c| format!("data: {c}\n\n"))
+            .collect::<Vec<_>>()
+            .join("");
+        let input: Vec<Result<Bytes, AiError>> = vec![Ok(Bytes::from(body))];
+        map_sse_to_events(ai_stream::sse_parse(futures::stream::iter(input)))
+            .map(|event| event.expect("stream event"))
+            .collect()
+            .await
+    }
+
+    #[test]
+    fn continuation_fragments_resolve_id_by_index() {
+        // First fragment announces id + name; continuations carry only the
+        // index. Deltas must stay keyed to the announced call id.
+        let mut state = ToolCallStreamState::default();
+        let started = json!({
+            "choices": [{"index": 0, "delta": {"tool_calls": [
+                {"index": 0, "id": "call_abc", "type": "function",
+                 "function": {"name": "calc", "arguments": ""}}
+            ]}, "finish_reason": null}]
+        });
+        let continuation = json!({
+            "choices": [{"index": 0, "delta": {"tool_calls": [
+                {"index": 0, "function": {"arguments": "{\"expr\""}}
+            ]}, "finish_reason": null}]
+        });
+
+        let mut events = Vec::new();
+        chunk_to_events(&mut state, &started, &mut events);
+        assert!(
+            matches!(&events[0], StreamEvent::ToolCallStarted { id, name } if id == "call_abc" && name == "calc")
+        );
+
+        chunk_to_events(&mut state, &continuation, &mut events);
+        assert_eq!(events.len(), 2);
+        assert!(
+            matches!(&events[1], StreamEvent::ToolCallDelta { id, arguments_delta }
+            if id == "call_abc" && arguments_delta == "{\"expr\"")
+        );
+    }
+
+    #[test]
+    fn repeated_name_fragments_emit_started_only_once_per_index() {
+        let chunk_with_name = json!({
+            "choices": [{"index": 0, "delta": {"tool_calls": [
+                {"index": 0, "id": "call_x", "type": "function",
+                 "function": {"name": "calc", "arguments": "{}"}}
+            ]}, "finish_reason": null}]
+        });
+        // Some providers repeat id + name on every fragment; shared stream
+        // state must emit Started exactly once for the slot.
+        let mut state = ToolCallStreamState::default();
+        let mut all = Vec::new();
+        chunk_to_events(&mut state, &chunk_with_name, &mut all);
+        chunk_to_events(&mut state, &chunk_with_name, &mut all);
+        chunk_to_events(&mut state, &chunk_with_name, &mut all);
+        assert_eq!(
+            all.iter()
+                .filter(|e| matches!(e, StreamEvent::ToolCallStarted { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn unannounced_index_gets_stable_synthesized_call_id() {
+        // A delta with neither id nor a previously announced index gets a
+        // stable placeholder, reused when the name arrives later.
+        let args_first = json!({
+            "choices": [{"index": 0, "delta": {"tool_calls": [
+                {"index": 2, "function": {"arguments": "{}"}}
+            ]}, "finish_reason": null}]
+        });
+        let mut state = ToolCallStreamState::default();
+        let mut events = Vec::new();
+        chunk_to_events(&mut state, &args_first, &mut events);
+        assert!(matches!(&events[0], StreamEvent::ToolCallDelta { id, .. } if id == "call-2"));
+
+        let name_after = json!({
+            "choices": [{"index": 0, "delta": {"tool_calls": [
+                {"index": 2, "id": "", "type": "function",
+                 "function": {"name": "late", "arguments": ""}}
+            ]}, "finish_reason": null}]
+        });
+        chunk_to_events(&mut state, &name_after, &mut events);
+        assert!(
+            matches!(&events[1], StreamEvent::ToolCallStarted { id, name }
+            if id == "call-2" && name == "late")
+        );
+    }
+
+    #[tokio::test]
+    async fn streamed_tool_call_fragments_survive_multi_chunk_streams() {
+        // Regression test for streamed argument loss: one Started chunk
+        // (id + function.name), then ≥3 args-only chunks carrying just the
+        // index — every fragment must survive into the finalized call.
+        let chunks = vec![
+            json!({"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[
+                {"index":0,"id":"call_abc","type":"function","function":{"name":"calc","arguments":""}}
+            ]},"finish_reason":null}],"usage":null}),
+            json!({"choices":[{"index":0,"delta":{"tool_calls":[
+                {"index":0,"function":{"arguments":"{\"expr\":"}}
+            ]},"finish_reason":null}],"usage":null}),
+            json!({"choices":[{"index":0,"delta":{"tool_calls":[
+                {"index":0,"function":{"arguments":"\"2+2\","}}
+            ]},"finish_reason":null}],"usage":null}),
+            json!({"choices":[{"index":0,"delta":{"tool_calls":[
+                {"index":0,"function":{"arguments":"\"precision\":2}"}}
+            ]},"finish_reason":null}],"usage":null}),
+            json!({"choices":[{"index":0,"delta":{"tool_calls":[
+                {"index":0,"function":{"arguments":""}}
+            ]},"finish_reason":null}],"usage":null}),
+            json!({"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],
+                   "usage":{"prompt_tokens":9,"completion_tokens":4}}),
+        ];
+        let events = map_sse_payloads(&chunks).await;
+
+        // Exactly one Started for the slot, keyed by the announced id.
+        let started: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ToolCallStarted { id, name } => Some((id.as_str(), name.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(started, vec![("call_abc", "calc")]);
+
+        // Every argument delta is keyed to that same id.
+        let deltas: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ToolCallDelta { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deltas.len(), 3);
+        assert!(deltas.iter().all(|id| *id == "call_abc"));
+
+        // Downstream assembly yields the FULL concatenated arguments.
+        let mut acc = ToolCallAccumulator::new();
+        for event in &events {
+            acc.push(event);
+        }
+        acc.finalize();
+        let calls = acc.completed();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "call_abc");
+        assert_eq!(calls[0].name, "calc");
+        assert_eq!(calls[0].arguments, r#"{"expr":"2+2","precision":2}"#);
+    }
+
+    #[tokio::test]
+    async fn interleaved_parallel_tool_calls_do_not_cross_contaminate() {
+        // Two calls interleaved by index: fragments of index 1 and index 2
+        // alternate, and each call must assemble only its own fragments.
+        let chunks = vec![
+            json!({"choices":[{"index":0,"delta":{"tool_calls":[
+                {"index":1,"id":"call_a","type":"function","function":{"name":"alpha","arguments":""}}
+            ]},"finish_reason":null}],"usage":null}),
+            json!({"choices":[{"index":0,"delta":{"tool_calls":[
+                {"index":2,"id":"call_b","type":"function","function":{"name":"beta","arguments":""}}
+            ]},"finish_reason":null}],"usage":null}),
+            json!({"choices":[{"index":0,"delta":{"tool_calls":[
+                {"index":2,"function":{"arguments":"[1"}}
+            ]},"finish_reason":null}],"usage":null}),
+            json!({"choices":[{"index":0,"delta":{"tool_calls":[
+                {"index":1,"function":{"arguments":"{\"x\":"}}
+            ]},"finish_reason":null}],"usage":null}),
+            json!({"choices":[{"index":0,"delta":{"tool_calls":[
+                {"index":2,"function":{"arguments":",2]"}}
+            ]},"finish_reason":null}],"usage":null}),
+            json!({"choices":[{"index":0,"delta":{"tool_calls":[
+                {"index":1,"function":{"arguments":"1}"}}
+            ]},"finish_reason":null}],"usage":null}),
+            json!({"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":null}),
+        ];
+        let events = map_sse_payloads(&chunks).await;
+
+        let mut acc = ToolCallAccumulator::new();
+        for event in &events {
+            acc.push(event);
+        }
+        acc.finalize();
+
+        // The adapter's finalize order follows HashMap drain order, so key
+        // by id instead of position.
+        let by_id: HashMap<&str, &ToolCall> =
+            acc.completed().iter().map(|c| (c.id.as_str(), c)).collect();
+        assert_eq!(by_id.len(), 2);
+        let a = by_id.get("call_a").expect("call_a assembled");
+        assert_eq!(a.name, "alpha");
+        assert_eq!(a.arguments, r#"{"x":1}"#);
+        let b = by_id.get("call_b").expect("call_b assembled");
+        assert_eq!(b.name, "beta");
+        assert_eq!(b.arguments, "[1,2]");
+    }
+
+    #[test]
+    fn build_body_float_params_have_no_widening_artifacts() {
+        let request = ChatRequest::new(vec![Message::text(Role::User, "hi")])
+            .with_temperature(0.2)
+            .with_top_p(0.9)
+            .with_frequency_penalty(0.5)
+            .with_presence_penalty(-0.25);
+        let body = build_chat_body(&request, "m", false).unwrap();
+        let raw = body.to_string();
+        assert!(raw.contains("\"temperature\":0.2"), "{raw}");
+        assert!(!raw.contains("0.20000000298"), "{raw}");
+        assert!(raw.contains("\"top_p\":0.9"), "{raw}");
+        assert!(raw.contains("\"frequency_penalty\":0.5"), "{raw}");
+        assert!(raw.contains("\"presence_penalty\":-0.25"), "{raw}");
     }
 
     #[test]
@@ -905,5 +1253,75 @@ mod tests {
         assert_eq!(completion.tool_calls.len(), 1);
         assert_eq!(completion.finish_reason.as_deref(), Some("tool_calls"));
         assert_eq!(completion.usage.total(), 15);
+    }
+
+    #[test]
+    fn parse_completion_accepts_openrouter_style_reasoning() {
+        // OpenRouter/Nous-style: `reasoning` string + `reasoning_details`
+        // array instead of DeepSeek's `reasoning_content`.
+        let response = json!({
+            "id": "x",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "391",
+                    "reasoning": "17*23 = 391",
+                    "reasoning_details": [{"type": "text", "text": "17*23 = 391"}]
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 8, "completion_tokens": 4, "total_tokens": 12}
+        });
+        let completion = parse_completion(
+            &ProviderId::new("opencode"),
+            &ModelId::new("stealth/ox-alpha"),
+            &response,
+        )
+        .unwrap();
+        assert_eq!(completion.reasoning.as_deref(), Some("17*23 = 391"));
+    }
+
+    #[test]
+    fn parse_completion_reasoning_details_fallback_when_no_string_field() {
+        let response = json!({
+            "id": "x",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "done",
+                    "reasoning_details": [
+                        {"type": "text", "text": "step one. "},
+                        {"type": "text", "text": "step two."}
+                    ]
+                },
+                "finish_reason": "stop"
+            }]
+        });
+        let completion = parse_completion(
+            &ProviderId::new("opencode"),
+            &ModelId::new("stealth/ox-alpha"),
+            &response,
+        )
+        .unwrap();
+        assert_eq!(completion.reasoning.as_deref(), Some("step one. step two."));
+    }
+
+    #[test]
+    fn chunk_to_events_maps_openrouter_style_reasoning_delta() {
+        let chunk = json!({
+            "choices": [{"delta": {"content": "", "reasoning": "thinking..."}}]
+        });
+        let mut state = ToolCallStreamState::default();
+        let mut events = Vec::new();
+        chunk_to_events(&mut state, &chunk, &mut events);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                StreamEvent::ReasoningDelta { delta } if delta == "thinking..."
+            )),
+            "expected ReasoningDelta from `reasoning` key: {events:?}"
+        );
     }
 }

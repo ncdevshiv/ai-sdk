@@ -7,6 +7,7 @@ mod extract;
 mod research;
 mod robots;
 mod search;
+mod sitemap;
 
 pub use crawler::{CrawlConfig, CrawlResult, Crawler, Page};
 pub use extract::{extract_links, extract_metadata, html_to_text};
@@ -16,6 +17,7 @@ pub use research::{
 };
 pub use robots::RobotsPolicy;
 pub use search::{DuckDuckGoSearch, SearchProvider, SearchResult};
+pub use sitemap::{SitemapEntry, SitemapIndexEntry, SitemapParser};
 pub use web_client::{FetchedPage, WebClient, WebClientConfig};
 
 mod web_client {

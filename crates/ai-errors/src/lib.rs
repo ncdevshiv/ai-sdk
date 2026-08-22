@@ -321,6 +321,12 @@ impl RateLimitError {
             source: None,
         }
     }
+
+    /// Sets the server-provided retry delay (builder style).
+    pub fn with_retry_after(mut self, retry_after: std::time::Duration) -> Self {
+        self.retry_after = Some(retry_after);
+        self
+    }
 }
 
 /// Deadline exceeded.
