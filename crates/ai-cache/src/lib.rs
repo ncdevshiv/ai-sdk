@@ -204,6 +204,15 @@ impl SemanticCache {
 }
 
 /// Cosine similarity of two vectors; `None` for empty/zero vectors.
+///
+/// ```
+/// use ai_cache::cosine_similarity;
+///
+/// let sim = cosine_similarity(&[0.5, 0.5], &[1.0, 1.0]).unwrap();
+/// assert!((sim - 1.0).abs() < 1e-6);
+/// // Degenerate inputs return None instead of NaN.
+/// assert!(cosine_similarity(&[0.0, 0.0], &[1.0, 1.0]).is_none());
+/// ```
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> Option<f32> {
     if a.len() != b.len() || a.is_empty() {
         return None;

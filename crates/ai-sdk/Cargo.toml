@@ -39,3 +39,6 @@ ai-orchestra = { path = "../ai-orchestra" }
 ai-errors = { path = "../ai-errors" }
 tokio.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+futures.workspace = true

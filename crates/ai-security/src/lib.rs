@@ -50,6 +50,15 @@ impl Redactor {
     }
 
     /// Replaces all known secrets and key-shaped tokens with `[REDACTED]`.
+    ///
+    /// ```
+    /// use ai_security::Redactor;
+    ///
+    /// let redactor = Redactor::new(vec!["hunter2-secret-value".into()]);
+    /// let out = redactor.redact("password is hunter2-secret-value ok");
+    /// assert!(!out.contains("hunter2-secret-value"));
+    /// assert!(out.contains("[REDACTED]"));
+    /// ```
     pub fn redact(&self, text: &str) -> String {
         let mut out = text.to_string();
         for secret in &self.secrets {

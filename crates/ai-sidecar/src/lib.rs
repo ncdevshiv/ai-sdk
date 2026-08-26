@@ -79,6 +79,7 @@ pub struct DiscoverParams {
 }
 
 /// Error raised inside a handler; becomes the JSON-RPC error response.
+#[cfg_attr(test, derive(Debug))]
 struct RpcError {
     code: i64,
     message: String,
@@ -582,4 +583,142 @@ impl Sidecar {
 fn parse_chat_request(params: &Value) -> Result<WireChatRequest, RpcError> {
     serde_json::from_value(params.get("request").cloned().unwrap_or(Value::Null))
         .map_err(|e| RpcError::invalid_params(format!("invalid request: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+    use std::time::Duration;
+    use tokio::io::BufReader;
+
+    fn cursor_reader(bytes: &[u8]) -> BufReader<Cursor<&[u8]>> {
+        BufReader::new(Cursor::new(bytes))
+    }
+
+    /// Unwraps a handler result without requiring `Debug` on the Ok type.
+    fn expect_err<T: std::fmt::Debug>(result: Result<T, RpcError>) -> RpcError {
+        match result {
+            Ok(value) => panic!("expected an error, got {value:?}"),
+            Err(err) => err,
+        }
+    }
+
+    #[tokio::test]
+    async fn read_line_capped_returns_frame_and_then_clean_eof() {
+        let mut reader = cursor_reader(b"{\"a\":1}\n{\"b\":2}\n");
+        assert_eq!(
+            read_line_capped(&mut reader, MAX_FRAME_BYTES)
+                .await
+                .unwrap(),
+            Some(b"{\"a\":1}".to_vec())
+        );
+        assert_eq!(
+            read_line_capped(&mut reader, MAX_FRAME_BYTES)
+                .await
+                .unwrap(),
+            Some(b"{\"b\":2}".to_vec())
+        );
+        assert_eq!(
+            read_line_capped(&mut reader, MAX_FRAME_BYTES)
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn read_line_capped_treats_unterminated_tail_as_a_frame() {
+        let mut reader = cursor_reader(b"no trailing newline");
+        assert_eq!(
+            read_line_capped(&mut reader, 64).await.unwrap(),
+            Some(b"no trailing newline".to_vec())
+        );
+    }
+
+    #[tokio::test]
+    async fn read_line_capped_rejects_oversized_frames_with_invalid_data() {
+        let oversized = "x".repeat(128);
+        let mut reader = cursor_reader(oversized.as_bytes());
+        let err = read_line_capped(&mut reader, 64).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("64 byte limit"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn read_line_capped_drains_oversized_frame_and_keeps_serving() {
+        // The oversized frame is rejected, but its bytes must be fully
+        // consumed so the loop keeps serving the next request.
+        let payload = format!("{}\nok\n", "x".repeat(200));
+        let mut reader = cursor_reader(payload.as_bytes());
+        let err = read_line_capped(&mut reader, 64).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(
+            read_line_capped(&mut reader, 64).await.unwrap(),
+            Some(b"ok".to_vec())
+        );
+    }
+
+    #[test]
+    fn error_object_maps_kinds_and_retryability() {
+        let configuration = error_object(&AiError::Configuration(
+            ai_errors::ConfigurationError::new("provider", "bad config"),
+        ));
+        assert_eq!(configuration["kind"], "configuration");
+        assert_eq!(configuration["retryable"], false);
+
+        let rate_limit = error_object(&AiError::RateLimit(
+            ai_errors::RateLimitError::new("openai", "slow down")
+                .with_retry_after(Duration::from_secs(1)),
+        ));
+        assert_eq!(rate_limit["kind"], "rate_limit");
+        assert_eq!(rate_limit["retryable"], true);
+
+        let timeout = error_object(&AiError::Timeout(ai_errors::TimeoutError::new(
+            "chat.generate",
+            Duration::from_secs(5),
+        )));
+        assert_eq!(timeout["kind"], "timeout");
+
+        let serialization = error_object(&AiError::Serialization(
+            ai_errors::SerializationError::new("bad json"),
+        ));
+        assert_eq!(serialization["kind"], "serialization");
+    }
+
+    #[test]
+    fn required_string_rejects_missing_empty_and_non_string() {
+        let params = json!({ "good": "v", "empty": "", "number": 7 });
+        assert_eq!(required_string(&params, "good").unwrap(), "v");
+        for key in ["missing", "empty", "number"] {
+            let err = match required_string(&params, key) {
+                Ok(value) => panic!("expected error for `{key}`, got {value}"),
+                Err(err) => err,
+            };
+            assert_eq!(err.code, INVALID_PARAMS);
+            assert!(err.message.contains(key), "{}", err.message);
+        }
+    }
+
+    #[test]
+    fn parse_chat_request_accepts_wire_shape_and_rejects_garbage() {
+        let params = json!({
+            "reference": "openai/gpt-4o",
+            "request": {
+                "messages": [
+                    { "role": "user", "parts": [ { "type": "text", "text": "hi" } ] }
+                ]
+            }
+        });
+        let request = parse_chat_request(&params).expect("wire-shaped chat request parses");
+        assert_eq!(request.messages.len(), 1);
+
+        let bad = json!({ "request": { "messages": "not-a-list" } });
+        let err = expect_err(parse_chat_request(&bad));
+        assert_eq!(err.code, INVALID_PARAMS);
+
+        // Absent `request` degrades to Null and must fail validation, not panic.
+        let err = expect_err(parse_chat_request(&json!({})));
+        assert_eq!(err.code, INVALID_PARAMS);
+    }
 }
