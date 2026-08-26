@@ -274,14 +274,12 @@ pub fn hybrid_fusion_with(
         HybridStrategy::WeightedAlpha => weighted_alpha_fusion(semantic, keyword, alpha),
         HybridStrategy::ReciprocalRank => {
             let mut semantic_ranked = semantic.to_vec();
-            semantic_ranked
-                .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            semantic_ranked.sort_by(deterministic_score_order);
             let mut keyword_ranked: Vec<(String, f32)> = keyword
                 .iter()
                 .map(|(id, score)| (id.clone(), *score))
                 .collect();
-            keyword_ranked
-                .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            keyword_ranked.sort_by(deterministic_score_order);
             reciprocal_rank_fusion(
                 &[
                     semantic_ranked
@@ -312,8 +310,17 @@ fn weighted_alpha_fusion(
         *scores.entry(id.clone()).or_insert(0.0) += (1.0 - alpha) * score;
     }
     let mut ranked: Vec<(String, f32)> = scores.into_iter().collect();
-    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    ranked.sort_by(deterministic_score_order);
     ranked
+}
+
+/// Score-descending comparator with an id tie-break: equal scores must not
+/// depend on `HashMap` iteration order (random per process), or recall
+/// boundaries flip between runs.
+fn deterministic_score_order(a: &(String, f32), b: &(String, f32)) -> std::cmp::Ordering {
+    b.1.partial_cmp(&a.1)
+        .unwrap_or(std::cmp::Ordering::Equal)
+        .then_with(|| a.0.cmp(&b.0))
 }
 
 #[cfg(test)]

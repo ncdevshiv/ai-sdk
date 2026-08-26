@@ -355,10 +355,26 @@ fn violations_in(rel_path: &str, text: &str) -> Vec<Hit> {
 #[test]
 fn workspace_docs_tell_the_truth() {
     let manifest = env!("CARGO_MANIFEST_DIR");
-    let crates_dir = Path::new(manifest)
-        .join("../../crates")
-        .canonicalize()
-        .expect("crates directory must exist relative to ai-devtools");
+    // No canonicalize(): it transiently fails (Win32 ERROR_FILE_NOT_FOUND)
+    // under post-build AV/journal load on Windows, and the walk only needs
+    // a consistent base for strip_prefix. A short retry guards against
+    // directory-enumeration transience.
+    let crates_dir = {
+        let base = Path::new(manifest).join("../../crates");
+        let mut attempt = 0;
+        loop {
+            if base.is_dir() {
+                break base;
+            }
+            attempt += 1;
+            assert!(
+                attempt <= 3,
+                "crates directory not found at {}",
+                base.display()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(150 * attempt as u64));
+        }
+    };
 
     let mut files = Vec::new();
     collect_rs_files(&crates_dir, &mut files);

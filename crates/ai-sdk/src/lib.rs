@@ -20,6 +20,9 @@ pub use ai_analytics::{Metric, MetricsRegistry, RateCounter};
 pub use ai_cache::model::{CachedModel, RequestCache, install_cache, register_cached};
 pub use ai_cache::{SemanticCache, TtlCache, cosine_similarity};
 pub use ai_cli::commands;
+pub use ai_computer::native::{ComputerTool, NativeComputerClient};
+pub use ai_computer::omnichrome::{BrowserTool as RealBrowserTool, OmniChromeClient};
+pub use ai_computer::{ComputerError, JsonRpcHttpClient};
 pub use ai_config::{Config, ProviderConfig};
 pub use ai_core::{
     AiClient, AiClientBuilder, ChatRequest, Model, Provider, ReasoningEffort, ResponseFormat,

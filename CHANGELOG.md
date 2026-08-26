@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+Native automation plugins — 2026-08-10 (`ai-computer` crate):
+
+- **Browser plugin** (`omnichrome.rs`): `OmniChromeClient` speaks the
+  OmniChrome Chrome-extension bridge protocol (JSON-RPC over
+  `http://localhost:8765/rpc`, bearer token from `OMNICHROME_TOKEN` /
+  `server/.bridge-token`) — navigate, click (xy/selector, with
+  client-side validation preventing the bridge's 30-second-hang trap),
+  human-cadence typing, screenshots (data-URL stripped → decoded PNG),
+  Markdown/scrape/a11y-tree extraction, JS evaluate, raw CDP calls,
+  network/console logs. Real `BrowserTool` replaces the simulated one.
+- **Desktop plugin** (`native.rs`): `NativeComputerClient` +
+  `ComputerTool` drive the Native Computer Use engine
+  (`http://localhost:8888/rpc`, bearer from `COMPUTERUSE_TOKEN` /
+  `%USERPROFILE%\.computeruse\auth.token`) — screenshots, OCR
+  text-finding, Set-of-Marks UI tree, Bézier mouse/keyboard/paste,
+  visual waits, window management, telemetry; keyboard actions
+  enforce the engine's `target` rule client-side and surface
+  sentinels like `TARGET_REQUIRED` verbatim.
+- Shared authenticated JSON-RPC transport (`jsonrpc_client.rs`)
+  encoding both engines' quirks: body-level errors regardless of HTTP
+  status, `id:null` correlation gap tolerated via per-call awaits,
+  non-standard `agent` echo ignored, data-URL handling.
+- 27 offline wire proofs against handcrafted HTTP/1.1 mock engines:
+  exact method/param casing, exact-string bearer auth, pre-network
+  validation (zero-dial guarantees), error-code mapping
+  (401/-32001→Unauthorized, -32000/-32601→typed), PNG magic checks.
+- Live smoke path documented: start the engines, then tools execute for
+  real; engine-down is a typed actionable error — nothing fabricated.
+
 Live-provider hardening — 2026-08-10 (verified against
 `https://inference-api.nousresearch.com/v1` with `stealth/ox-alpha`):
 
