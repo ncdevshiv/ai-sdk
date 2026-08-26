@@ -3,6 +3,7 @@
 use std::future::Future;
 use std::time::Duration;
 
+use rand::Rng;
 use tracing::{debug, warn};
 
 use ai_errors::{AiError, TimeoutError};
@@ -83,9 +84,11 @@ pub fn backoff_delay(attempt: u32, policy: &RetryPolicy) -> Duration {
     let capped = exp.min(policy.max_delay.as_millis() as f64);
     let jitter_amount = capped * policy.jitter;
     let jittered = if policy.jitter > 0.0 {
-        // Deterministic jitter for testability: derived from attempt count.
-        let seed = attempt.wrapping_mul(0x9E37_79B9).rotate_left(5);
-        let fraction = ((seed as f64) / (u32::MAX as f64)) * 2.0 - 1.0;
+        // Real randomness per call: deriving the fraction from the attempt
+        // number alone handed every caller the identical backoff sequence
+        // (thundering herd). `jitter = 0.0` remains fully deterministic for
+        // tests.
+        let fraction: f64 = rand::thread_rng().gen_range(-1.0..1.0);
         capped + jitter_amount * fraction
     } else {
         capped
@@ -108,7 +111,17 @@ where
 
     for attempt in 0..policy.max_attempts {
         if attempt > 0 {
-            let delay = backoff_delay(attempt - 1, policy);
+            // Prefer the server-provided `Retry-After` delay when the last
+            // error was a rate limit that carried one; otherwise use the
+            // configured exponential backoff (OpenAI SDKs ignore
+            // `Retry-After` — honoring it avoids hammering a throttled
+            // endpoint).
+            let delay = match last_error.as_ref() {
+                Some(AiError::RateLimit(rate_limit)) => rate_limit
+                    .retry_after
+                    .unwrap_or_else(|| backoff_delay(attempt - 1, policy)),
+                _ => backoff_delay(attempt - 1, policy),
+            };
             debug!(
                 operation,
                 attempt,
@@ -157,7 +170,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    use ai_errors::NetworkError;
+    use ai_errors::{NetworkError, RateLimitError};
 
     #[test]
     fn backoff_grows_exponentially_and_caps() {
@@ -180,6 +193,28 @@ mod tests {
             .with_jitter(0.0);
         let d = backoff_delay(4, &policy);
         assert_eq!(d, Duration::from_secs(9));
+    }
+
+    #[test]
+    fn jittered_delays_vary_and_respect_bounds() {
+        let policy = RetryPolicy::default()
+            .with_base_delay(Duration::from_millis(400))
+            .with_jitter(0.5);
+        let first = backoff_delay(0, &policy).as_millis();
+        let mut varied = false;
+        for _ in 0..200 {
+            let millis = backoff_delay(0, &policy).as_millis();
+            // ±50% around the 400 ms capped delay.
+            assert!(
+                (200..=600).contains(&millis),
+                "jittered delay {millis} ms outside bounds"
+            );
+            varied |= millis != first;
+        }
+        assert!(
+            varied,
+            "identical delays across 200 samples: jitter is not random"
+        );
     }
 
     #[tokio::test]
@@ -248,6 +283,34 @@ mod tests {
             calls.load(Ordering::SeqCst),
             1,
             "validation errors must not retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn rate_limit_retry_after_is_honored() {
+        let policy = RetryPolicy::default()
+            .with_max_attempts(3)
+            .with_base_delay(Duration::from_secs(10)) // long backoff: must NOT be used
+            .with_jitter(0.0);
+        let started = std::time::Instant::now();
+        let result: Result<i32> = retry(&policy, "test-op", || {
+            std::future::ready(Err(AiError::RateLimit(
+                RateLimitError::new("openai", "slow down")
+                    .with_retry_after(Duration::from_millis(30)),
+            )))
+        })
+        .await;
+        let elapsed = started.elapsed();
+        assert!(result.is_err());
+        // Two waits happened: each ~30 ms (Retry-After), far below the 10 s
+        // backoff — proving the server-provided delay was honored.
+        assert!(
+            elapsed < Duration::from_millis(1000),
+            "retry used Retry-After (elapsed {elapsed:?})"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(55),
+            "at least two waits happened"
         );
     }
 }

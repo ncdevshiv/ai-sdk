@@ -1,5 +1,20 @@
 # AI SDK Codebase Verification Report
 
+> ⚠️ **HISTORICAL ARTIFACT — SCOPE NOTICE (2026-08-10)**
+>
+> This report certifies the **removed TypeScript SDK** (the former `sdk/`
+> directory, since deleted from this repository). Every number and claim
+> below — including "All 371 tests pass", the package-by-package table,
+> and the "APPROVED FOR PRODUCTION" stamp — refers **only** to that
+> deleted TypeScript artifact.
+>
+> It does **not** describe the current Rust workspace at this repo root.
+> Current verification status lives in [`ENGINEERING-LOG.md`](./ENGINEERING-LOG.md)
+> and the CI pipeline ([`.github/workflows/ci.yml`](./.github/workflows/ci.yml)).
+>
+> Historical content is preserved verbatim below; do not cite it as
+> evidence about the Rust implementation.
+
 ## Executive Summary
 
 This report documents the comprehensive verification of the AI SDK codebase against PRD (Product Requirements Document) and VRD (Vendor Requirements Document) requirements, following the **Hardcode Rules**:

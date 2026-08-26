@@ -1,5 +1,7 @@
 //! Bounded concurrent crawler: BFS with depth/domain/include/exclude
-//! constraints, deduplication, caching, and rate limiting.
+//! constraints, deduplication, robots-aware fetch accounting, and per-host
+//! rate limiting. No response caching is performed; every queued URL is
+//! fetched through [`WebClient`].
 
 use std::collections::{HashSet, VecDeque};
 

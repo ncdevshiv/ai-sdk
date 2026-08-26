@@ -22,3 +22,11 @@ tokio.workspace = true
 tokio-util.workspace = true
 thiserror.workspace = true
 bytes.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+proptest.workspace = true
+
+[[bench]]
+name = "sse_bench"
+harness = false

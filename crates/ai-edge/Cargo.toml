@@ -12,3 +12,5 @@ categories.workspace = true
 
 [dependencies]
 ai-errors = { path = "../ai-errors" }
+serde = { workspace = true }
+serde_json = { workspace = true }

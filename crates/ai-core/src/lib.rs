@@ -11,15 +11,22 @@
 //! parallel execution and resilience on top of these traits.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use ai_errors::{AiError, ValidationError};
-use ai_models::{ModelInfo, ModelRegistry};
-use ai_types::{Completion, Message, StreamEvent};
+use ai_models::ModelRegistry;
+
+// Convenience re-exports: any [`Model`] implementor outside this crate needs
+// these names, and importing them through `ai-core` keeps the public surface
+// of dependent crates free of transitive dependencies. The internal code
+// below references these same names through these public imports.
+pub use ai_models::ModelInfo;
+pub use ai_types::{Completion, Message, Role, StreamEvent};
 
 /// Description of a tool the model may call.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -77,14 +84,35 @@ pub enum ResponseFormat {
     },
 }
 
-/// A chat completion request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Reasoning effort requested for reasoning models (e.g. OpenAI o1, o3-mini).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    Low,
+    Medium,
+    High,
+}
+
+impl fmt::Display for ReasoningEffort {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        };
+        f.write_str(s)
+    }
+}
+
+/// A request to a language model.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChatRequest {
+    /// Conversation history; at least one message is required.
     pub messages: Vec<Message>,
-    /// Tools made available to the model.
-    #[serde(default)]
+    /// Tool definitions made available to the model.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<ToolDefinition>,
-    /// Sampling temperature in `[0, 2]`.
+    /// Temperature in `[0, 2]`. Lower values are more deterministic.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
     /// Nucleus sampling: cumulative probability cutoff in `(0, 1]`.
@@ -102,6 +130,18 @@ pub struct ChatRequest {
     /// Structured output request.
     #[serde(default)]
     pub response_format: ResponseFormat,
+    /// Reasoning effort level for reasoning models (e.g. `low`, `medium`, `high`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
+    /// Seed for deterministic sampling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<u64>,
+    /// End-user identifier for safety/abuse monitoring.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    /// Whether to enable parallel tool execution on supported models.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
     /// Sequences that stop generation.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stop: Vec<String>,
@@ -123,6 +163,10 @@ impl Default for ChatRequest {
             presence_penalty: None,
             max_tokens: None,
             response_format: ResponseFormat::Text,
+            reasoning_effort: None,
+            seed: None,
+            user: None,
+            parallel_tool_calls: None,
             stop: Vec::new(),
             provider_options: serde_json::Value::Null,
         }
@@ -169,6 +213,26 @@ impl ChatRequest {
 
     pub fn with_response_format(mut self, format: ResponseFormat) -> Self {
         self.response_format = format;
+        self
+    }
+
+    pub fn with_reasoning_effort(mut self, effort: ReasoningEffort) -> Self {
+        self.reasoning_effort = Some(effort);
+        self
+    }
+
+    pub fn with_seed(mut self, seed: u64) -> Self {
+        self.seed = Some(seed);
+        self
+    }
+
+    pub fn with_user(mut self, user: impl Into<String>) -> Self {
+        self.user = Some(user.into());
+        self
+    }
+
+    pub fn with_parallel_tool_calls(mut self, enable: bool) -> Self {
+        self.parallel_tool_calls = Some(enable);
         self
     }
 
@@ -259,6 +323,11 @@ pub struct AiClient {
     registry: ModelRegistry,
     /// Default provider used when a model reference has no provider prefix.
     default_provider: Option<String>,
+    /// Pre-wrapped models registered directly by reference (the decoration
+    /// seam — see [`AiClient::register_model`]). Shared via `Arc<RwLock<_>>`
+    /// so resilience can be installed after construction without making the
+    /// client generically mutable.
+    models: Arc<RwLock<HashMap<String, Arc<dyn Model>>>>,
 }
 
 /// Builder for [`AiClient`].
@@ -267,6 +336,7 @@ pub struct AiClientBuilder {
     providers: HashMap<String, Arc<dyn Provider>>,
     registry: Option<ModelRegistry>,
     default_provider: Option<String>,
+    models: HashMap<String, Arc<dyn Model>>,
 }
 
 impl AiClientBuilder {
@@ -294,11 +364,37 @@ impl AiClientBuilder {
         self
     }
 
+    /// Registers a pre-built [`Model`] under an exact model reference.
+    ///
+    /// This is the dependency-inversion seam for higher-level crates: the
+    /// client resolves `provider:model` references through registered
+    /// providers, but it cannot depend on resilience/parallelism layers
+    /// (`ai-runtime`) without creating a cycle — `ai-runtime` already
+    /// depends on `ai-core`. Instead of inlining decoration logic here,
+    /// callers wrap models however they like and hand the finished,
+    /// possibly decorated `Arc<dyn Model>` to the client:
+    ///
+    /// ```ignore
+    /// // in a crate that sees both ai-core and ai-runtime:
+    /// let bare = client.resolve_model("openai:gpt-4o")?.1;
+    /// let resilient = Arc::new(ResilientModel::new(bare, policy));
+    /// client.register_model("openai:gpt-4o", resilient);
+    /// ```
+    ///
+    /// A registered model takes precedence over provider resolution for its
+    /// exact reference string. The default (no registrations) preserves the
+    /// historical behavior exactly.
+    pub fn register_model(mut self, reference: impl Into<String>, model: Arc<dyn Model>) -> Self {
+        self.models.insert(reference.into(), model);
+        self
+    }
+
     pub fn build(self) -> Result<AiClient, AiError> {
         Ok(AiClient {
             providers: self.providers,
             registry: self.registry.unwrap_or_else(ai_models::default_catalog),
             default_provider: self.default_provider,
+            models: Arc::new(RwLock::new(self.models)),
         })
     }
 }
@@ -322,9 +418,54 @@ impl AiClient {
         &self.registry
     }
 
+    /// Registers a pre-built (possibly resilience-decorated) [`Model`] on an
+    /// already-constructed client. See [`AiClientBuilder::register_model`]
+    /// for the design rationale.
+    ///
+    /// Registration is interior-mutable so resilience layers can decorate
+    /// models after the builder has produced the client; concurrent readers
+    /// observe either the previous or the new model for a reference, never a
+    /// torn state.
+    pub fn register_model(&self, reference: impl Into<String>, model: Arc<dyn Model>) {
+        self.models
+            .write()
+            .expect("model registry lock not poisoned")
+            .insert(reference.into(), model);
+    }
+
+    /// Model references that currently resolve through the registration
+    /// seam rather than provider resolution (sorted).
+    pub fn registered_references(&self) -> Vec<String> {
+        let mut refs: Vec<String> = self
+            .models
+            .read()
+            .expect("model registry lock not poisoned")
+            .keys()
+            .cloned()
+            .collect();
+        refs.sort();
+        refs
+    }
+
     /// Resolves a `provider:model` (or `provider/model`) reference. A bare
     /// model id resolves against the configured default provider.
+    ///
+    /// Resolution order: models registered via [`AiClient::register_model`]
+    /// (exact reference match) first — they are pre-wrapped decorations —
+    /// then registered providers.
     pub fn resolve_model(&self, reference: &str) -> Result<(String, Arc<dyn Model>), AiError> {
+        if let Some(model) = self
+            .models
+            .read()
+            .expect("model registry lock not poisoned")
+            .get(reference)
+            .cloned()
+        {
+            let provider_name = ModelRegistry::parse_reference(reference)
+                .map(|(p, _)| p)
+                .unwrap_or_else(|_| reference.to_string());
+            return Ok((provider_name, model));
+        }
         let (provider_name, model_id) = match ModelRegistry::parse_reference(reference) {
             Ok((p, m)) => (p, m),
             Err(_) => {
@@ -490,5 +631,139 @@ mod tests {
         let _: fn() -> AiClientBuilder = AiClient::builder;
         let _: Option<ContentPart> = None;
         let _: Option<Role> = None;
+    }
+
+    // ---- register_model seam -------------------------------------------------
+
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    struct CountingModel {
+        calls: AtomicU32,
+        text: &'static str,
+    }
+
+    impl CountingModel {
+        fn new(text: &'static str) -> Arc<Self> {
+            Arc::new(Self {
+                calls: AtomicU32::new(0),
+                text,
+            })
+        }
+    }
+
+    #[async_trait]
+    impl Model for CountingModel {
+        fn info(&self) -> &ModelInfo {
+            static INFO: std::sync::OnceLock<ModelInfo> = std::sync::OnceLock::new();
+            INFO.get_or_init(|| {
+                ModelInfo::new(
+                    ai_types::ProviderId::new("mock"),
+                    ai_types::ModelId::new("counting"),
+                    1_000,
+                    1_000,
+                )
+            })
+        }
+
+        async fn generate(&self, _request: ChatRequest) -> Result<Completion, AiError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Completion {
+                provider: self.info().provider.clone(),
+                model: self.info().id.clone(),
+                text: self.text.to_string(),
+                tool_calls: Vec::new(),
+                usage: Default::default(),
+                reasoning: None,
+                raw: serde_json::Value::Null,
+                finish_reason: Some("stop".into()),
+            })
+        }
+
+        async fn stream(&self, _request: ChatRequest) -> Result<EventStream, AiError> {
+            Err(AiError::Internal(ai_errors::InternalError::new(
+                "not implemented",
+            )))
+        }
+    }
+
+    #[tokio::test]
+    async fn registered_model_routes_generate_through_the_seam() {
+        let model = CountingModel::new("via-seam");
+        let client = AiClient::builder()
+            .register_model("mock:counting", Arc::clone(&model) as Arc<dyn Model>)
+            .build()
+            .unwrap();
+
+        let completion = client
+            .generate("mock:counting", vec![Message::text(Role::User, "hi")])
+            .await
+            .unwrap();
+        assert_eq!(completion.text, "via-seam");
+        assert_eq!(model.calls.load(Ordering::SeqCst), 1);
+
+        // The registration is visible through introspection and resolution.
+        assert_eq!(client.registered_references(), vec!["mock:counting"]);
+        let (provider, resolved) = client.resolve_model("mock:counting").unwrap();
+        assert_eq!(provider, "mock");
+        assert!(Arc::ptr_eq(
+            &resolved,
+            &(Arc::clone(&model) as Arc<dyn Model>)
+        ));
+    }
+
+    #[tokio::test]
+    async fn registered_model_takes_precedence_over_provider_resolution() {
+        let provider_model = CountingModel::new("from-provider");
+        let decorated = CountingModel::new("decorated");
+        let provider_model: Arc<CountingModel> = provider_model;
+
+        struct StaticProvider(Arc<CountingModel>);
+        #[async_trait]
+        impl Provider for StaticProvider {
+            fn id(&self) -> &str {
+                "mock"
+            }
+            async fn list_models(&self) -> Result<Vec<ModelInfo>, AiError> {
+                Ok(vec![self.0.info().clone()])
+            }
+            fn model(&self, _model_id: &str) -> Result<Arc<dyn Model>, AiError> {
+                Ok(Arc::clone(&self.0) as Arc<dyn Model>)
+            }
+        }
+
+        let client = AiClient::builder()
+            .provider(Arc::new(StaticProvider(Arc::clone(&provider_model))))
+            .register_model("mock:counting", Arc::clone(&decorated) as Arc<dyn Model>)
+            .build()
+            .unwrap();
+
+        let completion = client
+            .generate("mock:counting", vec![Message::text(Role::User, "hi")])
+            .await
+            .unwrap();
+        assert_eq!(completion.text, "decorated");
+        assert_eq!(
+            decorated.calls.load(Ordering::SeqCst),
+            1,
+            "the registered (decorated) model must serve"
+        );
+        assert_eq!(
+            provider_model.calls.load(Ordering::SeqCst),
+            0,
+            "provider resolution must be shadowed by the registration"
+        );
+
+        // Other references of the same provider still resolve via providers.
+        let completion = client
+            .generate("mock:other", vec![Message::text(Role::User, "hi")])
+            .await
+            .unwrap();
+        assert_eq!(completion.text, "from-provider");
+    }
+
+    #[test]
+    fn default_client_has_no_registrations_backward_compat() {
+        let client = AiClient::builder().build().unwrap();
+        assert!(client.registered_references().is_empty());
     }
 }

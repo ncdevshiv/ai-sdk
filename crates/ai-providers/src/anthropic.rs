@@ -21,7 +21,9 @@ use ai_types::{
 
 use ai_stream::sse_parse;
 
-use crate::http::{HttpClient, map_reqwest_error, map_response_error, parse_json};
+use crate::http::{
+    HttpClient, map_reqwest_error, map_response_error, parse_json, retry_after_from_headers,
+};
 
 /// The Anthropic API version header value.
 pub const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -78,7 +80,7 @@ impl AnthropicProvider {
     pub fn new(config: AnthropicConfig) -> Result<Self, AiError> {
         Ok(Self {
             config,
-            http: HttpClient::new()?,
+            http: HttpClient::shared(),
         })
     }
 
@@ -89,14 +91,14 @@ impl AnthropicProvider {
     async fn request_json(&self, body: Value) -> Result<Value, AiError> {
         let response = tokio::time::timeout(
             self.config.timeout,
-            self.http
-                .inner()
-                .post(self.url(MESSAGES_PATH))
-                .header("x-api-key", &self.config.api_key)
-                .header("anthropic-version", ANTHROPIC_VERSION)
-                .header("content-type", "application/json")
-                .json(&body)
-                .send(),
+            self.http.execute(
+                self.http
+                    .post(self.url(MESSAGES_PATH))
+                    .header("x-api-key", &self.config.api_key)
+                    .header("anthropic-version", ANTHROPIC_VERSION)
+                    .header("content-type", "application/json")
+                    .json(&body),
+            ),
         )
         .await
         .map_err(|_| {
@@ -108,13 +110,14 @@ impl AnthropicProvider {
         .map_err(|e| map_reqwest_error("anthropic.messages", e))?;
 
         let status = response.status();
+        let retry_after = retry_after_from_headers(response.headers());
         let bytes = response
             .bytes()
             .await
             .map_err(|e| map_reqwest_error("anthropic.messages", e))?
             .to_vec();
         if !status.is_success() {
-            return Err(map_response_error("anthropic", status, &bytes).await);
+            return Err(map_response_error("anthropic", status, retry_after, &bytes).await);
         }
         parse_json("anthropic.messages", &bytes)
     }
@@ -122,14 +125,14 @@ impl AnthropicProvider {
     async fn request_stream(&self, body: Value) -> Result<EventStream, AiError> {
         let response = tokio::time::timeout(
             self.config.timeout,
-            self.http
-                .inner()
-                .post(self.url(MESSAGES_PATH))
-                .header("x-api-key", &self.config.api_key)
-                .header("anthropic-version", ANTHROPIC_VERSION)
-                .header("content-type", "application/json")
-                .json(&body)
-                .send(),
+            self.http.execute(
+                self.http
+                    .post(self.url(MESSAGES_PATH))
+                    .header("x-api-key", &self.config.api_key)
+                    .header("anthropic-version", ANTHROPIC_VERSION)
+                    .header("content-type", "application/json")
+                    .json(&body),
+            ),
         )
         .await
         .map_err(|_| {
@@ -141,13 +144,14 @@ impl AnthropicProvider {
         .map_err(|e| map_reqwest_error("anthropic.messages", e))?;
 
         let status = response.status();
+        let retry_after = retry_after_from_headers(response.headers());
         if !status.is_success() {
             let bytes = response
                 .bytes()
                 .await
                 .map_err(|e| map_reqwest_error("anthropic.messages", e))?
                 .to_vec();
-            return Err(map_response_error("anthropic", status, &bytes).await);
+            return Err(map_response_error("anthropic", status, retry_after, &bytes).await);
         }
 
         let operation = "anthropic.messages".to_string();

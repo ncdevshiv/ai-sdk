@@ -54,9 +54,10 @@ no stubs, no placeholders).
 
 ## Getting Started
 
-> **Status:** All 25 crates implemented and verified — 220+ tests, 14/14
-> live gateway tests, `clippy -D warnings` clean, dual-era MCP, native
-> Anthropic/Gemini adapters, and a real CLI.
+> **Status:** Implemented across 25 Rust crates — ~270 unit tests plus a
+> 16-test credential-gated live-gateway suite. CI runs rustfmt, clippy,
+> and workspace tests; the live-gateway job runs only when its gateway
+> secrets are configured (gated on `env.AI_SDK_GATEWAY_API_KEY`).
 
 ```bash
 # Build the workspace

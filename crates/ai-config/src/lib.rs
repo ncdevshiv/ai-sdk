@@ -28,6 +28,17 @@ pub mod env_keys {
     pub const OLLAMA_BASE_URL: &str = "OLLAMA_BASE_URL";
     pub const GATEWAY_BASE_URL: &str = "AI_SDK_GATEWAY_BASE_URL";
     pub const GATEWAY_API_KEY: &str = "AI_SDK_GATEWAY_API_KEY";
+    /// Which configured provider to use when none is specified
+    /// (e.g. `opencode`, `openai`, `anthropic`).
+    pub const DEFAULT_PROVIDER: &str = "AI_SDK_PROVIDER";
+    /// Primary chat model id (also stored as the gateway provider's
+    /// `default_model` when the gateway is configured).
+    pub const PRIMARY_MODEL: &str = "AI_SDK_PRIMARY_MODEL";
+    /// Vision-capable model id (used by live tests/examples).
+    pub const VISION_MODEL: &str = "AI_SDK_VISION_MODEL";
+    /// Context window (tokens) of the primary model — surfaced so
+    /// applications and agents can budget prompts without hardcoding.
+    pub const PRIMARY_MODEL_CONTEXT_LENGTH: &str = "AI_SDK_PRIMARY_MODEL_CONTEXT_LENGTH";
     pub const CONFIG_FILE: &str = "AI_SDK_CONFIG";
     pub const DEFAULT_TIMEOUT: &str = "AI_SDK_DEFAULT_TIMEOUT";
     pub const DEFAULT_MAX_RETRIES: &str = "AI_SDK_MAX_RETRIES";
@@ -119,6 +130,16 @@ pub struct FileConfig {
 pub struct Config {
     pub providers: HashMap<String, ProviderConfig>,
     pub defaults: CallDefaults,
+    /// Provider used when a model reference has no provider prefix
+    /// (`AI_SDK_PROVIDER`).
+    pub default_provider: Option<String>,
+    /// Primary chat model id (`AI_SDK_PRIMARY_MODEL`).
+    pub primary_model: Option<String>,
+    /// Vision-capable model id (`AI_SDK_VISION_MODEL`).
+    pub vision_model: Option<String>,
+    /// Context window in tokens for the primary model
+    /// (`AI_SDK_PRIMARY_MODEL_CONTEXT_LENGTH`).
+    pub primary_model_context_length: Option<u64>,
 }
 
 impl Config {
@@ -225,6 +246,27 @@ impl Config {
         {
             self.defaults.max_retries = retries;
         }
+        // Model/provider selection.
+        if let Some(p) = non_empty_env(env_keys::DEFAULT_PROVIDER) {
+            self.default_provider = Some(p);
+        }
+        if let Some(m) = non_empty_env(env_keys::PRIMARY_MODEL) {
+            // Also record it as the gateway provider's default model so
+            // gateway users get model selection from one variable.
+            if let Some(entry) = self.providers.get_mut("opencode") {
+                entry.default_model = Some(m.clone());
+            }
+            self.primary_model = Some(m);
+        }
+        if let Some(v) = non_empty_env(env_keys::VISION_MODEL) {
+            self.vision_model = Some(v);
+        }
+        if let Some(len) = std::env::var(env_keys::PRIMARY_MODEL_CONTEXT_LENGTH)
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+        {
+            self.primary_model_context_length = Some(len);
+        }
     }
 
     /// Returns the config for a provider, or a typed error if absent.
@@ -283,6 +325,14 @@ fn set_env(map: &mut HashMap<String, ProviderConfig>, provider: &str, key: &str)
             entry.api_key = Some(value);
         }
     }
+}
+
+/// Reads an env var, treating empty/whitespace-only as unset.
+fn non_empty_env(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
 }
 
 /// Masks an API key, showing only the first 4 and last 4 characters.
@@ -369,5 +419,45 @@ default_model = "gpt-4o"
             },
         );
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn merge_env_reads_provider_model_and_context_length() {
+        // SAFETY (test-only): single-threaded mutation of these specific
+        // variables; removed afterwards so other tests are unaffected.
+        // (set_var/remove_var are unsafe as of edition 2024.)
+        for (key, value) in [
+            (env_keys::DEFAULT_PROVIDER, "opencode"),
+            (env_keys::GATEWAY_BASE_URL, "https://gw.example/v1"),
+            (env_keys::GATEWAY_API_KEY, "sk-env-test-key"),
+            (env_keys::PRIMARY_MODEL, "deepseek-v4-flash"),
+            (env_keys::VISION_MODEL, "mimo-v2.5"),
+            (env_keys::PRIMARY_MODEL_CONTEXT_LENGTH, "131072"),
+        ] {
+            unsafe { std::env::set_var(key, value) };
+        }
+
+        let mut cfg = Config::default();
+        cfg.merge_env();
+
+        assert_eq!(cfg.default_provider.as_deref(), Some("opencode"));
+        assert_eq!(cfg.primary_model.as_deref(), Some("deepseek-v4-flash"));
+        assert_eq!(cfg.vision_model.as_deref(), Some("mimo-v2.5"));
+        assert_eq!(cfg.primary_model_context_length, Some(131_072));
+        let gw = cfg.providers.get("opencode").expect("gateway configured");
+        assert_eq!(gw.base_url.as_deref(), Some("https://gw.example/v1"));
+        assert_eq!(gw.default_model.as_deref(), Some("deepseek-v4-flash"));
+
+        for key in [
+            env_keys::DEFAULT_PROVIDER,
+            env_keys::GATEWAY_BASE_URL,
+            env_keys::GATEWAY_API_KEY,
+            env_keys::PRIMARY_MODEL,
+            env_keys::VISION_MODEL,
+            env_keys::PRIMARY_MODEL_CONTEXT_LENGTH,
+        ] {
+            // SAFETY: restoring test-clean environment.
+            unsafe { std::env::remove_var(key) };
+        }
     }
 }

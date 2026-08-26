@@ -9,6 +9,100 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+Live-provider hardening — 2026-08-10 (verified against
+`https://inference-api.nousresearch.com/v1` with `stealth/ox-alpha`):
+
+- `ai-providers`: reasoning surfaced from OpenRouter/Nous-style
+  responses — `reasoning` string and structured `reasoning_details`
+  are now accepted alongside DeepSeek's `reasoning_content`, in both
+  non-streaming and streaming paths
+- `ai-providers`: sampling floats (`temperature`/`top_p`/penalties)
+  serialize without f32→f64 widening artifacts (`0.20000000298023224`)
+  that strict gateways reject with HTTP 400; shortest-roundtrip form
+  used instead (`0.2`)
+- `ai-providers`: optional `AI_SDK_DEBUG_WIRE=1` writes the exact
+  outbound request body to the temp dir for provider debugging
+- `ai-orchestra`: planner JSON Schemas are rewritten to OpenAI
+  *strict*-compatible shape (all properties required,
+  `additionalProperties: false`) before being advertised via
+  `ResponseFormat::JsonSchema`
+- `ai-orchestra`: live end-to-end proof (credential-gated):
+  real prompt → ambiguity assessment → LLM decomposition into a
+  5-node task tree → 3 concurrent pooled agents → all leaves
+  completed in ~37 s with full audit trail
+- `ai-config`: new env vars `AI_SDK_PROVIDER` (default provider),
+  `AI_SDK_PRIMARY_MODEL_CONTEXT_LENGTH` (surfaced for prompt
+  budgeting); `AI_SDK_PRIMARY_MODEL` also becomes the gateway
+  provider's default model; `.env.example` rewritten around them
+
+Rust workspace scaffold and proof-driven arcs — 2026-08-10 (each with
+CI-verifiable evidence):
+
+- **AEGIS** (`ai-runtime`, `ai-core`): `ResilientModel`/`FallbackModel`
+  decorators, `ResiliencePolicy` builder, deterministic fault-injecting
+  chaos HTTP server; SLO proof — 200/200 (100%) successful calls under
+  ~31% mixed faults (drops/stalls/500s/429s/garbage), p95 188 ms;
+  breaker opens/half-opens/recovers under chaos; limiter caps
+  server-observed in-flight exactly (`target/aegis-report.json`)
+- **CHRONO** (`ai-observability`, `ai-agents`, `ai-devtools`, `ai-cli`):
+  one correlated trace per agent run (span tree, RFC-3339 timestamps),
+  error-propagating JSONL export the SDK itself writes and reloads
+  losslessly, honest panic semantics; `ai trace --tui` time-travel
+  explorer plus `trace diff` / `trace verify`
+- **HERCULES** (`ai-agents`): per-task agent isolation
+  (`Agent::derive`, ephemeral run-scoped memory by default),
+  `SwarmEngine` with fan-out (real partial-failure accounting),
+  hierarchical map-reduce, competitive rounds with judge ledger,
+  token budgets; zero-cross-talk proof at 64 concurrent inputs;
+  env-gated 1,000-task live bench writing
+  `target/hercules-report.json`; fixed cumulative usage accounting,
+  memory-preserving retries, unknown-tool recovery feedback, and
+  HITL escalation to `AgentState::AwaitingInput`
+- **LEDGER** (`ai-stream`, `ai-runtime`, `ai-devtools`, CI):
+  criterion benches (SSE parse ~160 MiB/s small-event /
+  ~983 MiB/s multiline), doc-truth regression linter scanning all
+  crate sources for known false claims, mutation-testing pilot on
+  `ai-stream` (83.3% strict kill rate, survivors documented in
+  `MUTATION.md`), `bench-smoke` CI job
+- **SIREN** (`ai-protocols`, `ai-voice`): `RealtimeConnection`
+  WebSocket transport with tolerant unknown-event decoding,
+  `DuplexSession` barge-in loop measured at 29 µs detection→cancel
+  (bound 300 ms), real WAV parser with proptest round-trip,
+  adaptive noise-floor VAD (0 false triggers on ramped-noise
+  fixture vs ≥5 for the fixed threshold), configurable STT/TTS
+  builders
+- **MINERVA** (`ai-memory`, `ai-rag`, `ai-cache`): char-ngram
+  embeddings raising eval recall@5 from 0.857 to 1.000 (ties reported
+  honestly), true reciprocal-rank fusion + corpus-statistics BM25
+  (pipeline recall cap removed: 24→30 of 31 fixture hits end-to-end),
+  `CachedModel` request cache wired through the model seam with
+  hit/miss counter proofs
+
+### Fixed
+
+Truth-sprint hardening — 2026-08-10:
+
+- `ai-rag`: chunking forward-progress fix — overlap handling vs UTF-8
+  boundary snapping could stop advancing and loop/OOM on crafted input
+- `ai-rag`: proptest redesigns covering those chunker edge cases
+- `ai-providers`: streamed tool-call argument assembly now tracks by
+  tool-call id instead of chunk index; `Retry-After` response header
+  is honored on retries
+- `ai-runtime`: circuit-breaker probe-permit leak fixed (permit no
+  longer lost on early exit); limiter cold-start off-by-one fixed;
+  retry backoff switched to decorrelated jitter
+- `ai-stream`: property-test harness aligned with the SSE serializer
+  (round-trip parity)
+- `.github/workflows/ci.yml`: live-gateway job gate fixed — a job-level
+  `if` can access neither the `secrets` nor the `env` context (only
+  `github`/`inputs`/`needs`/`vars`; gating on `env.… != ''` at job level
+  made the whole workflow invalid). Credentials are exposed at
+  workflow-level `env` and the gate is applied per step via
+  `if: env.AI_SDK_GATEWAY_API_KEY != ''`, which is valid where `env`
+  exists; without secrets the job is a green no-op
+
+### Added
+
 - Rust workspace scaffold (25 crates) per `ENGINEERING-SPEC.md` — 2026-08-09
 - `ENGINEERING-SPEC.md`: Rust engineering specification adapted from the
   master template to the PRD v1.2 vision

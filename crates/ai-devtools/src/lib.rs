@@ -3,11 +3,15 @@
 //! sensitive data is never exposed.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 
 use ai_errors::{AiError, InternalError};
 use ai_observability::{
     EventCollector, EventKind, EventStatus, ExecutionEvent, chronological_report,
 };
+
+pub mod diff;
+pub mod verify;
 
 /// A filtered view of one trace.
 #[derive(Debug, Clone)]
@@ -94,6 +98,12 @@ impl Inspector {
         self.redactor.redact(&report)
     }
 
+    /// Applies this inspector's configured redaction to arbitrary text
+    /// (exposed so TUI/CLI detail panes reuse exactly the same rules).
+    pub fn redact(&self, text: &str) -> String {
+        self.redactor.redact(text)
+    }
+
     /// The JSON-lines export of a trace with sensitive metadata redacted.
     pub fn export_json(&self, trace_id: &str) -> Result<String, AiError> {
         let events = self.trace(trace_id);
@@ -109,6 +119,39 @@ impl Inspector {
     pub fn collector(&self) -> &EventCollector {
         &self.collector
     }
+}
+
+/// Loads a JSON-lines event export back into a collector, losslessly:
+/// `wall_time`, `offset_ms`, trace/span ids, and order are preserved
+/// exactly as persisted (no offset re-basing, no timestamp regeneration).
+pub fn load_trace(text: &str) -> Result<EventCollector, AiError> {
+    let collector = EventCollector::new();
+    for (index, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let event = ExecutionEvent::from_jsonl(line).map_err(|e| {
+            AiError::Internal(InternalError::new(format!(
+                "invalid event on line {}: {e}",
+                index + 1
+            )))
+        })?;
+        collector.insert_event(event);
+    }
+    Ok(collector)
+}
+
+/// Loads a JSONL event file written by [`JsonLinesExporter`](ai_observability::JsonLinesExporter)
+/// or [`Inspector::export_json`]. See [`load_trace`] for the guarantees.
+pub fn load_trace_file(path: impl AsRef<Path>) -> Result<EventCollector, AiError> {
+    let path = path.as_ref();
+    let text = std::fs::read_to_string(path).map_err(|e| {
+        AiError::Internal(InternalError::new(format!(
+            "cannot read {}: {e}",
+            path.display()
+        )))
+    })?;
+    load_trace(&text)
 }
 
 #[cfg(test)]
@@ -191,5 +234,93 @@ mod tests {
         assert!(!json.contains("abcdef1234567890xyz"), "{json}");
         let parsed: serde_json::Value = serde_json::from_str(json.lines().next().unwrap()).unwrap();
         assert_eq!(parsed["kind"], "model_call");
+    }
+
+    fn persisted_event(wall_time: &str, offset_ms: u64, span: &str) -> ExecutionEvent {
+        ExecutionEvent {
+            wall_time: wall_time.to_string(),
+            offset_ms,
+            trace_id: "trace-roundtrip".to_string(),
+            span_id: span.to_string(),
+            parent_span_id: if span == "s0" {
+                None
+            } else {
+                Some("s0".to_string())
+            },
+            kind: EventKind::AgentStep,
+            operation: format!("op-{span}"),
+            status: EventStatus::Succeeded,
+            duration_ms: Some(9),
+            metadata: BTreeMap::from([("step".into(), serde_json::json!(span))]),
+        }
+    }
+
+    #[test]
+    fn load_trace_reconstructs_events_exactly() {
+        let originals = vec![
+            persisted_event("2001-02-03T04:05:06.123456789Z", 0, "s0"),
+            persisted_event("2001-02-03T04:05:06.5Z", 37, "s1"),
+            persisted_event("2001-02-03T04:05:07.25Z", 1204, "s2"),
+        ];
+        let jsonl = originals
+            .iter()
+            .map(|event| event.to_jsonl().unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let reloaded = load_trace(&jsonl).expect("valid JSONL loads");
+        assert_eq!(reloaded.events(), originals, "round trip is lossless");
+
+        // Chronology survives: offsets and wall clocks are untouched.
+        for (original, loaded) in originals.iter().zip(reloaded.events()) {
+            assert_eq!(loaded.wall_time, original.wall_time);
+            assert_eq!(loaded.offset_ms, original.offset_ms);
+            assert_eq!(loaded.trace_id, original.trace_id);
+            assert_eq!(loaded.parent_span_id, original.parent_span_id);
+        }
+    }
+
+    #[test]
+    fn load_trace_file_round_trips_and_inspector_sees_one_trace() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "ai-sdk-devtools-roundtrip-{}.jsonl",
+            std::process::id()
+        ));
+        let originals = vec![
+            persisted_event("2024-06-01T00:00:00Z", 0, "s0"),
+            persisted_event("2024-06-01T00:00:00.001Z", 1, "s1"),
+        ];
+        std::fs::write(
+            &path,
+            originals
+                .iter()
+                .map(|e| e.to_jsonl().unwrap())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let collector = load_trace_file(&path).expect("file loads");
+        std::fs::remove_file(&path).ok();
+        assert_eq!(collector.events(), originals);
+
+        // The loaded trace groups as ONE multi-event trace with intact
+        // chronology (this is what the CLI-side loader must preserve too).
+        let inspector = Inspector::new(collector);
+        let traces = inspector.traces();
+        assert_eq!(traces.len(), 1);
+        assert_eq!(traces[0].trace_id, "trace-roundtrip");
+        assert_eq!(traces[0].events.len(), 2);
+        assert_eq!(traces[0].duration_ms, 1);
+        assert_eq!(inspector.trace("trace-roundtrip").len(), 2);
+    }
+
+    #[test]
+    fn load_trace_rejects_invalid_lines() {
+        let Err(err) = load_trace("{\"wall_time\":") else {
+            panic!("malformed line must be rejected");
+        };
+        assert!(err.to_string().contains("invalid event on line 1"), "{err}");
     }
 }

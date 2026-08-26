@@ -30,10 +30,38 @@ pub fn chunk_document(document: &str, strategy: ChunkingStrategy) -> Vec<Chunk> 
             let mut index = 0usize;
             let mut start = 0usize;
             while start < document.len() {
-                let end = (start + size).min(document.len());
+                // Snap the window to character boundaries so slicing never
+                // panics on multi-byte UTF-8.
+                let mut end = (start + size).min(document.len());
+                while end > start && !document.is_char_boundary(end) {
+                    end -= 1;
+                }
+                if end == start {
+                    // `size` is smaller than the width of the character at
+                    // `start`; widen the window just past that character so
+                    // the slice stays valid and scanning makes progress.
+                    // Without this the empty window could never advance.
+                    end = start + 1;
+                    while !document.is_char_boundary(end) {
+                        end += 1;
+                    }
+                }
                 let text = &document[start..end];
-                if text.trim().is_empty() {
-                    break;
+                // Skip windows carrying no coverable content. Must match the
+                // coverage definition (ASCII whitespace): `str::trim` also
+                // drops e.g. U+000B VERTICAL TAB and NBSP, which are NOT
+                // ASCII whitespace, so using `trim` here silently dropped
+                // bytes the caller still expects chunks to cover.
+                if text.bytes().all(|b| b.is_ascii_whitespace()) {
+                    // Skip whitespace-only windows — they carry no content —
+                    // but keep scanning so the rest of the document is not
+                    // silently dropped. `end > start` always holds here, so
+                    // this path strictly advances.
+                    if end >= document.len() {
+                        break;
+                    }
+                    start = end;
+                    continue;
                 }
                 chunks.push(Chunk {
                     text: text.to_string(),
@@ -44,7 +72,21 @@ pub fn chunk_document(document: &str, strategy: ChunkingStrategy) -> Vec<Chunk> 
                 if end >= document.len() {
                     break;
                 }
-                start = end.saturating_sub(overlap);
+                // Overlap rewinds the next start, but never behind the start
+                // of the chunk just emitted: UTF-8 snapping above can leave
+                // the effective window shorter than `overlap`, and rewinding
+                // to `<= start` would re-emit the same chunk forever.
+                let mut next_start = end.saturating_sub(overlap);
+                if next_start <= start {
+                    next_start = end;
+                }
+                // Snap forward (never backward) to a character boundary, so
+                // `start` strictly increases on every iteration and the loop
+                // is guaranteed to terminate.
+                while !document.is_char_boundary(next_start) {
+                    next_start += 1;
+                }
+                start = next_start;
             }
             chunks
         }
@@ -55,11 +97,12 @@ pub fn chunk_document(document: &str, strategy: ChunkingStrategy) -> Vec<Chunk> 
             let mut current_start = 0usize;
             let mut index = 0usize;
 
-            let mut char_positions: Vec<usize> = document.char_indices().map(|(i, _)| i).collect();
-            char_positions.push(document.len());
-
-            for (i, sentence) in split_sentences(document).into_iter().enumerate() {
-                let sentence_start = char_positions.get(i).copied().unwrap_or(0);
+            // Track the byte offset of each sentence as it is produced, so
+            // chunk starts point at the true position in the source.
+            let mut offset = 0usize;
+            for sentence in split_sentences(document) {
+                let sentence_start = offset;
+                offset += sentence.len();
                 if current.len() + sentence.len() > max_size && !current.is_empty() {
                     chunks.push(Chunk {
                         text: std::mem::take(&mut current),
@@ -162,6 +205,83 @@ mod tests {
         );
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].text, "hi");
+    }
+
+    /// Regression: with multi-byte text, UTF-8 boundary snapping can leave a
+    /// window shorter than the requested overlap (or even empty when `size`
+    /// is below the character width). Chunking must still advance strictly
+    /// monotonically, terminate quickly, and cover every non-whitespace byte.
+    #[test]
+    fn fixed_chunking_multibyte_large_overlap_terminates_and_covers() {
+        let doc = "日本語のテキスト 🦀🚀 絵文字😀 混合";
+        for size in [1usize, 2, 3, 5] {
+            for overlap in [0usize, 1, 4, 31] {
+                let chunks = chunk_document(doc, ChunkingStrategy::Fixed { size, overlap });
+                assert!(!chunks.is_empty(), "size {size} overlap {overlap}");
+                for pair in chunks.windows(2) {
+                    assert!(
+                        pair[0].start < pair[1].start,
+                        "starts must strictly increase (size {size}, overlap {overlap})"
+                    );
+                }
+                let mut covered = vec![false; doc.len()];
+                for chunk in &chunks {
+                    assert!(
+                        doc.is_char_boundary(chunk.start)
+                            && doc[chunk.start..].starts_with(chunk.text.as_str()),
+                        "chunk at invalid offset (size {size}, overlap {overlap}): {chunk:?}"
+                    );
+                    for slot in &mut covered[chunk.start..chunk.start + chunk.text.len()] {
+                        *slot = true;
+                    }
+                }
+                for (i, b) in doc.as_bytes().iter().enumerate() {
+                    if !b.is_ascii_whitespace() {
+                        assert!(
+                            covered[i],
+                            "byte {i} uncovered (size {size}, overlap {overlap})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Regression: `size` smaller than one character width must not stall on
+    /// an empty snapped window; each non-whitespace character becomes a
+    /// chunk and scanning always advances.
+    #[test]
+    fn fixed_chunking_size_below_char_width_advances() {
+        let doc = "héllo🌍!";
+        let chunks = chunk_document(
+            doc,
+            ChunkingStrategy::Fixed {
+                size: 1,
+                overlap: 0,
+            },
+        );
+        let joined: String = chunks.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(joined, doc, "one chunk per character, content preserved");
+        for pair in chunks.windows(2) {
+            assert!(pair[0].start < pair[1].start);
+        }
+    }
+
+    /// Regression: U+000B VERTICAL TAB is Unicode whitespace but not ASCII
+    /// whitespace; windows containing it must be emitted so their bytes stay
+    /// covered by chunking.
+    #[test]
+    fn fixed_chunking_keeps_non_ascii_whitespace_covered() {
+        let chunks = chunk_document(
+            "\u{b}x",
+            ChunkingStrategy::Fixed {
+                size: 1,
+                overlap: 0,
+            },
+        );
+        assert_eq!(chunks.len(), 2, "{chunks:?}");
+        assert_eq!(chunks[0].text, "\u{b}");
+        assert_eq!(chunks[1].text, "x");
     }
 
     #[test]

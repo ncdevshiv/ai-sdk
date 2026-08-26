@@ -2,11 +2,13 @@
 //! permissions, execution IDs/tracing hooks, built-in tools, and a skills
 //! registry (PRD §3.3).
 
+pub mod browser;
 mod builtins;
 mod math;
 mod registry;
 mod schema;
 
+pub use browser::{BrowserAction, BrowserTool};
 pub use builtins::{HttpTool, MathTool, TimeTool, UuidTool};
 pub use math::evaluate_expression;
 pub use registry::{Skill, SkillRegistry, ToolRegistry};
@@ -167,6 +169,7 @@ pub fn default_tools() -> ToolRegistry {
     registry.register(Arc::new(TimeTool));
     registry.register(Arc::new(MathTool));
     registry.register(Arc::new(UuidTool));
+    registry.register(Arc::new(BrowserTool::new()));
     registry
 }
 

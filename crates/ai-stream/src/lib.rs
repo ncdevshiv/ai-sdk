@@ -567,3 +567,6 @@ mod tests {
         assert_eq!(completion.finish_reason.as_deref(), Some("tool_calls"));
     }
 }
+
+#[cfg(test)]
+mod proptests;

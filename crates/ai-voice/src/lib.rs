@@ -1,10 +1,20 @@
-//! Voice (PRD §3.5): audio types, an energy-based VAD, and STT/TTS traits
-//! with a real OpenAI-compatible adapter. Realtime full-duplex streaming
-//! requires provider credentials and is documented as a limitation.
+//! Voice (PRD §3.5): audio types, an energy-based VAD with adaptive noise
+//! floor, WAV parsing/writing, configurable STT/TTS adapters, and a full-
+//! duplex realtime voice session ([`DuplexSession`]) with barge-in over the
+//! [`ai_protocols`] WebSocket transport.
+//!
+//! Layering note: `ai-voice` depends on `ai-protocols` because the duplex
+//! session orchestrates protocol-level realtime events (`RealtimeConnection`,
+//! `RealtimeClientEvent`) with voice-domain primitives (VAD, PCM audio).
+//! No other crate depends on either, so the direction stays acyclic.
 
+mod session;
 mod vad;
+mod wav;
 
+pub use session::{BargeIn, DuplexSession, DuplexSessionConfig, JitterBuffer, SessionNotification};
 pub use vad::{VadConfig, VadDecision, VoiceActivityDetector};
+pub use wav::{parse_wav, wav_from_pcm, wav_from_pcm_stereo};
 
 use async_trait::async_trait;
 
@@ -35,7 +45,7 @@ impl Audio {
         }
     }
 
-    /// Resamples to a target rate (linear interpolation) — real, simple
+    /// Resamples to a target rate (linear interpolation) -- real, simple
     /// resampling used before provider upload.
     pub fn resample(&self, target_rate: u32) -> Self {
         if target_rate == 0 || target_rate == self.sample_rate || self.samples.is_empty() {
@@ -53,6 +63,11 @@ impl Audio {
         }
         Self::from_samples(out, target_rate)
     }
+
+    /// Encodes samples as little-endian PCM16 bytes.
+    pub fn to_pcm_le_bytes(&self) -> Vec<u8> {
+        self.samples.iter().flat_map(|s| s.to_le_bytes()).collect()
+    }
 }
 
 /// Speech-to-text provider.
@@ -68,12 +83,42 @@ pub trait TextToSpeech: Send + Sync {
     async fn synthesize(&self, text: &str) -> Result<(Vec<u8>, String), AiError>;
 }
 
+/// Pure construction of the STT multipart form fields (no HTTP involved).
+///
+/// Extracted so builder wiring is testable without a wire round-trip.
+fn build_stt_form_fields(
+    model: &str,
+    language: Option<&str>,
+    prompt: Option<&str>,
+) -> Vec<(String, String)> {
+    let mut fields = vec![("model".to_string(), model.to_string())];
+    if let Some(lang) = language {
+        fields.push(("language".to_string(), lang.to_string()));
+    }
+    if let Some(prompt) = prompt {
+        fields.push(("prompt".to_string(), prompt.to_string()));
+    }
+    fields
+}
+
+/// Pure construction of the TTS JSON request body (no HTTP involved).
+fn build_tts_request_body(model: &str, voice: &str, input: &str) -> serde_json::Value {
+    serde_json::json!({
+        "model": model,
+        "input": input,
+        "voice": voice,
+    })
+}
+
 /// Real OpenAI-compatible STT adapter (`POST {base}/audio/transcriptions`,
-/// whisper model). Requires an API key.
+/// whisper model). Requires an API key. Defaults: model `whisper-1`, no
+/// language/prompt override; override via the fluent builders.
 pub struct OpenAiCompatSpeechToText {
     base_url: String,
     api_key: String,
     model: String,
+    language: Option<String>,
+    prompt: Option<String>,
     client: reqwest::Client,
 }
 
@@ -83,11 +128,31 @@ impl OpenAiCompatSpeechToText {
             base_url: base_url.into(),
             api_key: api_key.into(),
             model: "whisper-1".to_string(),
+            language: None,
+            prompt: None,
             client: reqwest::Client::builder()
                 .user_agent("ai-sdk-voice/0.1")
                 .build()
                 .map_err(|e| AiError::Web(WebError::new("stt client", e.to_string())))?,
         })
+    }
+
+    /// Overrides the transcription model (default `whisper-1`).
+    pub fn model(mut self, model: impl Into<String>) -> Self {
+        self.model = model.into();
+        self
+    }
+
+    /// Pins the spoken language as an ISO-639-1 hint (e.g. `"en"`).
+    pub fn language(mut self, language: impl Into<String>) -> Self {
+        self.language = Some(language.into());
+        self
+    }
+
+    /// Provides a spelling/vocabulary hint prompt.
+    pub fn prompt(mut self, prompt: impl Into<String>) -> Self {
+        self.prompt = Some(prompt.into());
+        self
     }
 }
 
@@ -99,25 +164,29 @@ impl SpeechToText for OpenAiCompatSpeechToText {
             self.base_url.trim_end_matches('/')
         );
         let audio = audio.resample(16_000);
-        let pcm = audio.samples;
-        let bytes: Vec<u8> = pcm.iter().flat_map(|s| s.to_le_bytes()).collect();
-        let wav = wav_from_pcm(&bytes, audio.sample_rate);
+        let wav = wav_from_pcm(&audio.to_pcm_le_bytes(), audio.sample_rate);
+
+        let mut form = reqwest::multipart::Form::new();
+        for (name, value) in build_stt_form_fields(
+            &self.model,
+            self.language.as_deref(),
+            self.prompt.as_deref(),
+        ) {
+            form = form.text(name, value);
+        }
+        form = form.part(
+            "file",
+            reqwest::multipart::Part::bytes(wav)
+                .file_name("audio.wav")
+                .mime_str("audio/wav")
+                .map_err(|e| AiError::Web(WebError::new("stt", e.to_string())))?,
+        );
 
         let response = self
             .client
             .post(&url)
             .bearer_auth(&self.api_key)
-            .multipart(
-                reqwest::multipart::Form::new()
-                    .text("model", self.model.clone())
-                    .part(
-                        "file",
-                        reqwest::multipart::Part::bytes(wav)
-                            .file_name("audio.wav")
-                            .mime_str("audio/wav")
-                            .map_err(|e| AiError::Web(WebError::new("stt", e.to_string())))?,
-                    ),
-            )
+            .multipart(form)
             .send()
             .await
             .map_err(|e| AiError::Web(WebError::new("stt", e.to_string())))?;
@@ -143,9 +212,11 @@ impl SpeechToText for OpenAiCompatSpeechToText {
 }
 
 /// Real OpenAI-compatible TTS adapter (`POST {base}/audio/speech`).
+/// Defaults: model `tts-1`, voice `alloy`; override via the fluent builders.
 pub struct OpenAiCompatTextToSpeech {
     base_url: String,
     api_key: String,
+    model: String,
     voice: String,
     client: reqwest::Client,
 }
@@ -155,12 +226,25 @@ impl OpenAiCompatTextToSpeech {
         Ok(Self {
             base_url: base_url.into(),
             api_key: api_key.into(),
+            model: "tts-1".to_string(),
             voice: "alloy".to_string(),
             client: reqwest::Client::builder()
                 .user_agent("ai-sdk-voice/0.1")
                 .build()
                 .map_err(|e| AiError::Web(WebError::new("tts client", e.to_string())))?,
         })
+    }
+
+    /// Overrides the synthesis model (default `tts-1`).
+    pub fn model(mut self, model: impl Into<String>) -> Self {
+        self.model = model.into();
+        self
+    }
+
+    /// Selects the provider voice (default `alloy`).
+    pub fn voice(mut self, voice: impl Into<String>) -> Self {
+        self.voice = voice.into();
+        self
     }
 }
 
@@ -172,11 +256,7 @@ impl TextToSpeech for OpenAiCompatTextToSpeech {
             .client
             .post(&url)
             .bearer_auth(&self.api_key)
-            .json(&serde_json::json!({
-                "model": "tts-1",
-                "input": text,
-                "voice": self.voice
-            }))
+            .json(&build_tts_request_body(&self.model, &self.voice, text))
             .send()
             .await
             .map_err(|e| AiError::Web(WebError::new("tts", e.to_string())))?;
@@ -204,28 +284,6 @@ impl TextToSpeech for OpenAiCompatTextToSpeech {
     }
 }
 
-/// Wraps raw PCM in a minimal WAV container (16-bit mono).
-fn wav_from_pcm(pcm: &[u8], sample_rate: u32) -> Vec<u8> {
-    let data_len = pcm.len() as u32;
-    let byte_rate = sample_rate * 2;
-    let mut wav = Vec::with_capacity(44 + pcm.len());
-    wav.extend_from_slice(b"RIFF");
-    wav.extend_from_slice(&(36 + data_len).to_le_bytes());
-    wav.extend_from_slice(b"WAVE");
-    wav.extend_from_slice(b"fmt ");
-    wav.extend_from_slice(&16u32.to_le_bytes());
-    wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
-    wav.extend_from_slice(&1u16.to_le_bytes()); // mono
-    wav.extend_from_slice(&sample_rate.to_le_bytes());
-    wav.extend_from_slice(&byte_rate.to_le_bytes());
-    wav.extend_from_slice(&2u16.to_le_bytes()); // block align
-    wav.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
-    wav.extend_from_slice(b"data");
-    wav.extend_from_slice(&data_len.to_le_bytes());
-    wav.extend_from_slice(pcm);
-    wav
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,23 +305,46 @@ mod tests {
     }
 
     #[test]
-    fn wav_header_is_valid() {
-        let pcm = vec![0u8; 4];
-        let wav = wav_from_pcm(&pcm, 16_000);
-        assert_eq!(&wav[..4], b"RIFF");
-        assert_eq!(&wav[8..12], b"WAVE");
-        assert_eq!(u32::from_le_bytes([wav[40], wav[41], wav[42], wav[43]]), 4);
-        assert_eq!(wav.len(), 48);
+    fn stt_form_fields_reflect_builder_defaults_and_overrides() {
+        // Defaults preserved: just whisper-1, no extras.
+        assert_eq!(
+            build_stt_form_fields("whisper-1", None, None),
+            vec![("model".to_string(), "whisper-1".to_string())]
+        );
+        // Builder overrides flow through to the wire fields.
+        let adapter = OpenAiCompatSpeechToText::new("http://localhost", "key")
+            .unwrap()
+            .model("whisper-large-v3")
+            .language("de")
+            .prompt("SIREN, barge-in");
+        assert_eq!(
+            build_stt_form_fields(
+                &adapter.model,
+                adapter.language.as_deref(),
+                adapter.prompt.as_deref()
+            ),
+            vec![
+                ("model".into(), "whisper-large-v3".into()),
+                ("language".into(), "de".into()),
+                ("prompt".into(), "SIREN, barge-in".into()),
+            ]
+        );
     }
 
     #[test]
-    fn vad_detects_speech_and_silence() {
-        let mut detector = VoiceActivityDetector::new(VadConfig::default());
-        // Pure silence.
-        let silence = Audio::from_samples(vec![0i16; 320], 16_000);
-        assert_eq!(detector.process(&silence), VadDecision::Silence);
-        // Loud signal.
-        let speech = Audio::from_samples(vec![3000i16; 320], 16_000);
-        assert_eq!(detector.process(&speech), VadDecision::Speech);
+    fn tts_request_body_reflects_builder_defaults_and_overrides() {
+        // Defaults preserved: tts-1 + alloy.
+        assert_eq!(
+            build_tts_request_body("tts-1", "alloy", "hello"),
+            serde_json::json!({"model": "tts-1", "input": "hello", "voice": "alloy"})
+        );
+        let adapter = OpenAiCompatTextToSpeech::new("http://localhost", "key")
+            .unwrap()
+            .model("tts-1-hd")
+            .voice("nova");
+        assert_eq!(
+            build_tts_request_body(&adapter.model, &adapter.voice, "hi"),
+            serde_json::json!({"model": "tts-1-hd", "input": "hi", "voice": "nova"})
+        );
     }
 }

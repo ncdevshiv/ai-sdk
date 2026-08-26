@@ -15,12 +15,15 @@ use serde::{Deserialize, Serialize};
 pub struct ProviderId(String);
 
 impl ProviderId {
-    /// Creates a [`ProviderId`], panicking on empty input. Prefer
-    /// [`ProviderId::try_new`] in code that handles untrusted input.
+    /// Creates a [`ProviderId`]. If input is empty, defaults to `"unknown"`.
+    /// Prefer [`ProviderId::try_new`] for fallible validation.
     pub fn new(id: impl Into<String>) -> Self {
         let id = id.into();
-        assert!(!id.is_empty(), "provider id must not be empty");
-        Self(id)
+        if id.is_empty() {
+            Self("unknown".to_string())
+        } else {
+            Self(id)
+        }
     }
 
     /// Creates a [`ProviderId`], returning `None` for empty input.
@@ -51,10 +54,15 @@ impl From<ProviderId> for String {
 pub struct ModelId(String);
 
 impl ModelId {
+    /// Creates a [`ModelId`]. If input is empty, defaults to `"unknown"`.
+    /// Prefer [`ModelId::try_new`] for fallible validation.
     pub fn new(id: impl Into<String>) -> Self {
         let id = id.into();
-        assert!(!id.is_empty(), "model id must not be empty");
-        Self(id)
+        if id.is_empty() {
+            Self("unknown".to_string())
+        } else {
+            Self(id)
+        }
     }
 
     pub fn try_new(id: impl Into<String>) -> Option<Self> {
@@ -256,10 +264,11 @@ pub struct Message {
 
 impl Message {
     pub fn new(role: Role, parts: Vec<ContentPart>) -> Self {
-        assert!(
-            !parts.is_empty(),
-            "message must have at least one content part"
-        );
+        let parts = if parts.is_empty() {
+            vec![ContentPart::text("")]
+        } else {
+            parts
+        };
         Self {
             role,
             parts,

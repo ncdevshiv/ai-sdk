@@ -97,7 +97,7 @@ impl Capabilities {
     }
 }
 
-/// Build-target helpers for WASM compilation.
+/// Build-target helpers and JS/WASM interop for WASM compilation.
 pub mod wasm {
     /// True when compiled for a WASM target.
     pub const IS_WASM: bool = cfg!(target_arch = "wasm32");
@@ -120,6 +120,16 @@ pub mod wasm {
         {
             None
         }
+    }
+
+    /// Prepares a JSON payload string for WASM boundary transfer.
+    pub fn serialize_payload<T: serde::Serialize>(val: &T) -> Result<String, String> {
+        serde_json::to_string(val).map_err(|e| e.to_string())
+    }
+
+    /// Deserializes a JSON string payload from WASM boundary input.
+    pub fn deserialize_payload<T: serde::de::DeserializeOwned>(json: &str) -> Result<T, String> {
+        serde_json::from_str(json).map_err(|e| e.to_string())
     }
 }
 

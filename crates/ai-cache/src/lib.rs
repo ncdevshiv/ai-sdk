@@ -1,5 +1,18 @@
-//! Caching: TTL cache, semantic cache interface, and request/response
-//! caching for model calls (spec §4.5 cost optimization).
+//! Caching: TTL cache, semantic cache interface, and client-side
+//! request/response caching for model calls (spec §4.5 cost optimization).
+//!
+//! The [`model::CachedModel`] decorator wraps any `ai_core::Model` and
+//! serves repeated `generate()` calls from a [`model::RequestCache`]
+//! (exact canonical-request hashing, optional semantic similarity layer),
+//! exposing `hits()`/`misses()` counters. Streaming is passed through by
+//! design. Wire it into an `ai_core::AiClient` in one call via
+//! [`model::install_cache`] or [`model::register_cached`] — the same
+//! register_model decoration seam ai-runtime's resilience uses.
+
+pub mod model;
+
+#[cfg(test)]
+mod model_tests;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -276,3 +289,6 @@ mod tests {
         assert_eq!(CacheStats::default().hit_rate(), 0.0);
     }
 }
+
+#[cfg(test)]
+mod proptests;

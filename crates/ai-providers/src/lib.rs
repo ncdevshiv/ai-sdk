@@ -15,10 +15,16 @@
 //! are credential-gated (documented per ENGINEERING-SPEC §40).
 
 pub mod anthropic;
+pub mod assistants;
+pub mod batch;
+pub mod files;
 pub mod finetune;
 pub mod gemini;
 pub mod http;
+pub mod images;
+pub mod moderation;
 pub mod openai_compat;
+pub mod vector_stores;
 
 use std::sync::Arc;
 

@@ -25,7 +25,9 @@ members = [
     "crates/ai-edge",
     "crates/ai-voice",
     "crates/ai-cli",
+    "crates/ai-computer",
     "crates/ai-sdk",
+    "crates/ai-orchestra",
 ]
 
 [workspace.package]
@@ -84,7 +86,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 # Benchmarking
 criterion = { version = "0.5", features = ["async_tokio"] }
 # Property-based testing
-proptest = "1"
+proptest = { version = "1", features = ["regex-syntax"] }
 # Random (jitter, backoff)
 rand = "0.8"
 # Async mutex/storage helpers
