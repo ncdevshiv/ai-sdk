@@ -349,6 +349,7 @@ dependencies = [
  "ai-analytics",
  "ai-cache",
  "ai-cli",
+ "ai-computer",
  "ai-config",
  "ai-core",
  "ai-devtools",
@@ -385,6 +386,24 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.20",
  "url",
+]
+
+[[package]]
+name = "ai-sidecar"
+version = "0.1.0"
+dependencies = [
+ "ai-config",
+ "ai-core",
+ "ai-errors",
+ "ai-models",
+ "ai-providers",
+ "ai-types",
+ "async-trait",
+ "futures",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml",
 ]
 
 [[package]]

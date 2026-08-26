@@ -17,6 +17,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::StreamExt;
+use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
 use serde_json::{Value, json};
 
 use ai_core::{ChatRequest, EventStream, Model, Provider, ResponseFormat};
@@ -50,7 +51,8 @@ pub struct OpenAiCompatConfig {
     pub base_url: String,
     /// Per-call timeout (defaults to 30 s when unset).
     pub timeout: Duration,
-    /// Extra static headers (e.g. OpenRouter HTTP-Referer).
+    /// Extra static headers (e.g. OpenRouter HTTP-Referer), applied to every
+    /// outgoing request. Adapter-set headers (`Authorization`) win conflicts.
     pub extra_headers: Vec<(String, String)>,
 }
 
@@ -133,18 +135,53 @@ impl OpenAiCompatProvider {
         format!("{}/{}", self.config.base_url.trim_end_matches('/'), path)
     }
 
+    /// Builds the headers for an outgoing request: [`OpenAiCompatConfig::
+    /// extra_headers`] first, then the adapter-owned `Authorization` inserted
+    /// last so it replaces any conflicting extra. Invalid names or values in
+    /// `extra_headers` fail the request with a configuration error instead of
+    /// being silently dropped.
+    fn request_headers(&self) -> Result<HeaderMap, AiError> {
+        let mut headers = HeaderMap::new();
+        for (name, value) in &self.config.extra_headers {
+            let name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
+                AiError::Configuration(ai_errors::ConfigurationError::new(
+                    "extra_headers",
+                    format!("invalid header name `{name}`"),
+                ))
+            })?;
+            let value = HeaderValue::from_str(value).map_err(|_| {
+                AiError::Configuration(ai_errors::ConfigurationError::new(
+                    "extra_headers",
+                    format!("invalid header value for `{name}`"),
+                ))
+            })?;
+            headers.insert(name, value);
+        }
+        let auth =
+            HeaderValue::from_str(&format!("Bearer {}", self.config.api_key)).map_err(|_| {
+                AiError::Configuration(ai_errors::ConfigurationError::new(
+                    "api_key",
+                    "api key contains characters invalid in an HTTP header",
+                ))
+            })?;
+        headers.insert(AUTHORIZATION, auth);
+        Ok(headers)
+    }
+
     /// Executes a JSON request and returns the parsed body, mapping HTTP
     /// errors to typed [`AiError`]s.
     async fn request_json(&self, path: &str, body: Value) -> Result<Value, AiError> {
         let operation = format!("{}.{}", self.config.provider_id, path);
+        let url = self.url(path);
+        let headers = self.request_headers()?;
+        if wire_debug_enabled() {
+            let body_bytes = serde_json::to_vec(&body).unwrap_or_default();
+            write_wire_debug("POST", &url, &headers, &body_bytes);
+        }
         let response = tokio::time::timeout(
             self.config.timeout,
-            self.http.execute(
-                self.http
-                    .post(self.url(path))
-                    .bearer_auth(&self.config.api_key)
-                    .json(&body),
-            ),
+            self.http
+                .execute(self.http.post(url).headers(headers).json(&body)),
         )
         .await
         .map_err(|_| {
@@ -154,10 +191,6 @@ impl OpenAiCompatProvider {
             ))
         })?
         .map_err(|e| map_reqwest_error(&operation, e))?;
-        if std::env::var("AI_SDK_DEBUG_WIRE").as_deref() == Ok("1") {
-            let path = std::env::temp_dir().join("dsh-wire-debug.json");
-            let _ = std::fs::write(&path, body.to_string());
-        }
 
         let status = response.status();
         let retry_after = retry_after_from_headers(response.headers());
@@ -178,14 +211,16 @@ impl OpenAiCompatProvider {
     /// Opens a streaming request and returns the raw SSE byte stream.
     async fn request_stream(&self, path: &str, body: Value) -> Result<EventStream, AiError> {
         let operation = format!("{}.{}", self.config.provider_id, path);
+        let url = self.url(path);
+        let headers = self.request_headers()?;
+        if wire_debug_enabled() {
+            let body_bytes = serde_json::to_vec(&body).unwrap_or_default();
+            write_wire_debug("POST", &url, &headers, &body_bytes);
+        }
         let response = tokio::time::timeout(
             self.config.timeout,
-            self.http.execute(
-                self.http
-                    .post(self.url(path))
-                    .bearer_auth(&self.config.api_key)
-                    .json(&body),
-            ),
+            self.http
+                .execute(self.http.post(url).headers(headers).json(&body)),
         )
         .await
         .map_err(|_| {
@@ -448,6 +483,139 @@ fn clean_f32(v: f32) -> Value {
     }
 }
 
+/// Reads `AI_SDK_DEBUG_WIRE`; `None` when unset or blank. Any non-blank
+/// value selects the redacted debug record; exactly `full` opts into also
+/// embedding the request body.
+fn wire_debug_mode() -> Option<String> {
+    std::env::var("AI_SDK_DEBUG_WIRE")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+fn wire_debug_enabled() -> bool {
+    wire_debug_mode().is_some()
+}
+
+/// Writes a debug record for an outgoing request to
+/// `<tmp>/dsh-wire-debug.json` when `AI_SDK_DEBUG_WIRE` is set.
+///
+/// The default mode records the method, URL, header names (credential
+/// values — `Authorization` and anything containing `api-key` — replaced by
+/// `***`), the body byte length, and the body's SHA-256 hex digest; message
+/// content never reaches disk. `AI_SDK_DEBUG_WIRE=full` additionally embeds
+/// the complete request body for offline diagnosis.
+fn write_wire_debug(method: &str, url: &str, headers: &HeaderMap, body: &[u8]) {
+    let Some(mode) = wire_debug_mode() else {
+        return;
+    };
+    let mut wire_headers = serde_json::Map::new();
+    for (name, value) in headers {
+        let name = name.as_str();
+        let value = if name.contains("authorization") || name.contains("api-key") {
+            "***".to_string()
+        } else {
+            value
+                .to_str()
+                .map(str::to_string)
+                .unwrap_or_else(|_| "<binary>".to_string())
+        };
+        wire_headers.insert(name.to_string(), Value::String(value));
+    }
+    let mut record = json!({
+        "method": method,
+        "url": url,
+        "headers": wire_headers,
+        "body_bytes": body.len(),
+        "body_sha256": sha256_hex(body),
+    });
+    if mode == "full" {
+        record["body"] = Value::String(String::from_utf8_lossy(body).into_owned());
+    }
+    let path = std::env::temp_dir().join("dsh-wire-debug.json");
+    let _ = std::fs::write(&path, record.to_string());
+}
+
+/// SHA-256 message digest (FIPS 180-4), hex-encoded.
+///
+/// Hand-rolled because the workspace carries no hash dependency and this
+/// debug record is its only consumer.
+fn sha256_hex(data: &[u8]) -> String {
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+    const H0: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
+
+    // Pad: 0x80, zeros to 56 mod 64, then the big-endian bit length.
+    let bit_len = (data.len() as u64).wrapping_mul(8);
+    let mut message = Vec::with_capacity(data.len() + 72);
+    message.extend_from_slice(data);
+    message.push(0x80);
+    while message.len() % 64 != 56 {
+        message.push(0);
+    }
+    message.extend_from_slice(&bit_len.to_be_bytes());
+
+    let mut state = H0;
+    for chunk in message.chunks_exact(64) {
+        let mut w = [0u32; 64];
+        for (word, bytes) in w.iter_mut().zip(chunk.chunks_exact(4)) {
+            *word = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        }
+        for i in 16..w.len() {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = state;
+        for (&k, wi) in K.iter().zip(w.iter()) {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ ((!e) & g);
+            let t1 = h
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(k)
+                .wrapping_add(*wi);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let t2 = s0.wrapping_add(maj);
+            h = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(t1);
+            d = c;
+            c = b;
+            b = a;
+            a = t1.wrapping_add(t2);
+        }
+        state[0] = state[0].wrapping_add(a);
+        state[1] = state[1].wrapping_add(b);
+        state[2] = state[2].wrapping_add(c);
+        state[3] = state[3].wrapping_add(d);
+        state[4] = state[4].wrapping_add(e);
+        state[5] = state[5].wrapping_add(f);
+        state[6] = state[6].wrapping_add(g);
+        state[7] = state[7].wrapping_add(h);
+    }
+    state.iter().map(|word| format!("{word:08x}")).collect()
+}
+
 fn build_chat_body(request: &ChatRequest, model: &str, stream: bool) -> Result<Value, AiError> {
     let mut body = json!({
         "model": model,
@@ -636,10 +804,14 @@ fn serialize_user_content(message: &Message) -> Result<Value, AiError> {
                 })),
             },
             ContentPart::Audio { audio } => match audio {
-                ai_types::AudioSource::Url { url } => parts.push(json!({
-                    "type": "input_audio",
-                    "input_audio": {"data": url, "format": "wav"}
-                })),
+                // The OpenAI `input_audio` format only accepts inline base64
+                // data; serializing a URL into `input_audio.data` would send
+                // a broken payload, so reject it at construction time.
+                ai_types::AudioSource::Url { .. } => {
+                    return Err(AiError::Validation(ai_errors::ValidationError::new(
+                        "audio input by URL is not supported by this adapter",
+                    )));
+                }
                 ai_types::AudioSource::Base64 { media_type, data } => parts.push(json!({
                     "type": "input_audio",
                     "input_audio": {"data": data, "format": media_type.trim_start_matches("audio/")}
@@ -699,18 +871,36 @@ fn parse_completion(
 
     let mut tool_calls = Vec::new();
     if let Some(calls) = message.get("tool_calls").and_then(|t| t.as_array()) {
-        for call in calls {
-            if let (Some(id), Some(name), Some(args)) = (
-                call.get("id").and_then(|i| i.as_str()),
-                call.pointer("/function/name").and_then(|n| n.as_str()),
-                call.pointer("/function/arguments").and_then(|a| a.as_str()),
-            ) {
-                tool_calls.push(ToolCall {
-                    id: id.to_string(),
-                    name: name.to_string(),
-                    arguments: args.to_string(),
-                });
-            }
+        for (index, call) in calls.iter().enumerate() {
+            let id = call
+                .get("id")
+                .and_then(|i| i.as_str())
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    AiError::Validation(ai_errors::ValidationError::new(format!(
+                        "tool_calls[{index}] missing id"
+                    )))
+                })?;
+            let name = call
+                .pointer("/function/name")
+                .and_then(|n| n.as_str())
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    AiError::Validation(ai_errors::ValidationError::new(format!(
+                        "tool_calls[{index}] missing name"
+                    )))
+                })?;
+            // Providers may omit `arguments` entirely or send an empty
+            // string; both mean "no arguments".
+            let arguments = match call.pointer("/function/arguments").and_then(|a| a.as_str()) {
+                Some(args) if !args.is_empty() => args,
+                _ => "{}",
+            };
+            tool_calls.push(ToolCall {
+                id: id.to_string(),
+                name: name.to_string(),
+                arguments: arguments.to_string(),
+            });
         }
     }
 
@@ -766,13 +956,14 @@ impl Provider for OpenAiCompatProvider {
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>, AiError> {
         let operation = format!("{}.list_models", self.config.provider_id);
+        let url = self.url("models");
+        let headers = self.request_headers()?;
+        if wire_debug_enabled() {
+            write_wire_debug("GET", &url, &headers, &[]);
+        }
         let response = tokio::time::timeout(
             self.config.timeout,
-            self.http.execute(
-                self.http
-                    .get(self.url("models"))
-                    .bearer_auth(&self.config.api_key),
-            ),
+            self.http.execute(self.http.get(url).headers(headers)),
         )
         .await
         .map_err(|_| {
@@ -1322,6 +1513,326 @@ mod tests {
                 StreamEvent::ReasoningDelta { delta } if delta == "thinking..."
             )),
             "expected ReasoningDelta from `reasoning` key: {events:?}"
+        );
+    }
+
+    #[test]
+    fn sha256_matches_known_vectors() {
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            sha256_hex(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
+            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+        );
+    }
+
+    /// Serializes tests that touch `AI_SDK_DEBUG_WIRE` / the shared
+    /// `<tmp>/dsh-wire-debug.json` record.
+    static WIRE_DEBUG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn wire_debug_record_is_redacted_unless_full_is_requested() {
+        let _guard = WIRE_DEBUG_LOCK.lock().unwrap();
+        const KEY: &str = "AI_SDK_DEBUG_WIRE";
+        let secret_key = "sk-super-secret-wire-key";
+        let secret_message = "confidential-user-message-content";
+        let body = format!(r#"{{"messages":[{{"content":"{secret_message}"}}]}}"#);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {secret_key}")).unwrap(),
+        );
+        headers.insert("x-api-key", HeaderValue::from_str("api-key-12345").unwrap());
+        headers.insert("x-trace-id", HeaderValue::from_str("trace-open").unwrap());
+
+        let path = std::env::temp_dir().join("dsh-wire-debug.json");
+
+        // SAFETY (test-only): single-threaded mutation of this variable under
+        // WIRE_DEBUG_LOCK, removed afterwards so other tests are unaffected.
+        unsafe { std::env::set_var(KEY, "1") };
+        write_wire_debug(
+            "POST",
+            "https://gateway.example/v1/chat/completions",
+            &headers,
+            body.as_bytes(),
+        );
+        let written = std::fs::read_to_string(&path).expect("redacted record written");
+        assert!(written.contains(r#""method":"POST""#), "{written}");
+        assert!(
+            written.contains("gateway.example/v1/chat/completions"),
+            "{written}"
+        );
+        assert!(written.contains(r#""authorization":"***""#), "{written}");
+        assert!(written.contains(r#""x-api-key":"***""#), "{written}");
+        assert!(
+            written.contains(r#""x-trace-id":"trace-open""#),
+            "non-credential headers keep their value: {written}"
+        );
+        assert!(
+            written.contains(&format!(r#""body_bytes":{}"#, body.len())),
+            "{written}"
+        );
+        assert!(
+            written.contains(&format!(
+                r#""body_sha256":"{}""#,
+                sha256_hex(body.as_bytes())
+            )),
+            "{written}"
+        );
+        // Neither the key nor any message text may leak into the record.
+        assert!(!written.contains(secret_key), "{written}");
+        assert!(!written.contains("api-key-12345"), "{written}");
+        assert!(!written.contains(secret_message), "{written}");
+
+        // `full` opts into embedding the body.
+        unsafe { std::env::set_var(KEY, "full") };
+        write_wire_debug(
+            "POST",
+            "https://gateway.example/v1/chat/completions",
+            &headers,
+            body.as_bytes(),
+        );
+        let written = std::fs::read_to_string(&path).expect("full record written");
+        assert!(
+            written.contains(secret_message),
+            "full mode embeds the body: {written}"
+        );
+
+        unsafe { std::env::remove_var(KEY) };
+    }
+
+    /// Spawns a minimal HTTP/1.1 server that records each request's raw head
+    /// and answers `/models` with a model list, streaming chat requests with
+    /// SSE, and everything else with a plain completion. Every response uses
+    /// `connection: close`, so each request arrives on its own connection.
+    fn spawn_capture_server() -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        fn find_head_end(buf: &[u8]) -> Option<usize> {
+            buf.windows(4).position(|w| w == b"\r\n\r\n")
+        }
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_task = captured.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let captured_conn = captured_task.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    let head_end = loop {
+                        let n = socket.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                        if let Some(pos) = find_head_end(&buf) {
+                            break pos;
+                        }
+                    };
+                    let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+                    let content_length = head
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            if name.trim().eq_ignore_ascii_case("content-length") {
+                                value.trim().parse::<usize>().ok()
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or(0);
+                    while buf.len() < head_end + 4 + content_length {
+                        let n = socket.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                    }
+                    let is_get = head.starts_with("GET");
+                    captured_conn.lock().unwrap().push(head);
+
+                    let body_text = String::from_utf8_lossy(&buf[head_end + 4..]).to_string();
+                    let payload = if is_get {
+                        r#"{"data":[{"id":"mock-model"}]}"#.to_string()
+                    } else if body_text.contains(r#""stream":true"#) {
+                        format!(
+                            "data: {}\n\ndata: [DONE]\n\n",
+                            r#"{"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}"#
+                        )
+                    } else {
+                        r#"{"choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#
+                            .to_string()
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{payload}",
+                        payload.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        (format!("http://{addr}"), captured)
+    }
+
+    #[tokio::test]
+    // Test-only: the guard serializes against `wire_debug_record_is_redacted…`
+    // over the shared `<tmp>/dsh-wire-debug.json` record and its env var.
+    #[allow(clippy::await_holding_lock)]
+    async fn extra_headers_reach_the_wire_and_authorization_wins() {
+        let _guard = WIRE_DEBUG_LOCK.lock().unwrap();
+        let (base_url, captured) = spawn_capture_server();
+
+        let mut config = OpenAiCompatConfig::new("mock", "sk-live-secret-key", base_url);
+        config.extra_headers = vec![
+            ("X-Custom-Trace".to_string(), "trace-42".to_string()),
+            ("authorization".to_string(), "Bearer attacker".to_string()),
+        ];
+        let provider = OpenAiCompatProvider::new(config).expect("provider builds");
+        let model = provider.model("mock-model").expect("model resolves");
+
+        // GET /models via list_models.
+        let models = provider.list_models().await.expect("models listed");
+        assert_eq!(models.len(), 1);
+
+        // POST /chat/completions via generate.
+        let completion = model
+            .generate(ChatRequest::new(vec![Message::text(Role::User, "hi")]))
+            .await
+            .expect("generate succeeds");
+        assert_eq!(completion.text, "hi");
+
+        // POST /chat/completions with stream:true via stream.
+        let events: Vec<_> = model
+            .stream(ChatRequest::new(vec![Message::text(Role::User, "hi")]))
+            .await
+            .expect("stream opens")
+            .collect()
+            .await;
+        assert!(
+            events.iter().all(Result::is_ok),
+            "stream errors: {events:?}"
+        );
+
+        // Every outgoing request carried the custom header, exactly one
+        // Authorization header, and the adapter-owned credential won.
+        let heads = captured.lock().unwrap();
+        assert_eq!(heads.len(), 3, "all three requests seen: {heads:?}");
+        for head in heads.iter() {
+            let lower = head.to_ascii_lowercase();
+            assert!(
+                lower.contains("x-custom-trace: trace-42"),
+                "custom header missing from request:\n{head}"
+            );
+            let auth_lines: Vec<_> = lower
+                .lines()
+                .filter(|line| line.starts_with("authorization:"))
+                .collect();
+            assert_eq!(
+                auth_lines,
+                vec!["authorization: bearer sk-live-secret-key"],
+                "adapter-owned authorization must win over extra_headers:\n{head}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_completion_defaults_missing_arguments_to_empty_object() {
+        let response = json!({
+            "choices": [{
+                "message": {
+                    "tool_calls": [
+                        {"id": "call_1", "function": {"name": "no_args"}},
+                        {"id": "call_2", "function": {"name": "empty_args", "arguments": ""}}
+                    ]
+                }
+            }]
+        });
+        let completion =
+            parse_completion(&ProviderId::new("opencode"), &ModelId::new("m"), &response)
+                .expect("missing/empty arguments are valid");
+        let args: Vec<&str> = completion
+            .tool_calls
+            .iter()
+            .map(|c| c.arguments.as_str())
+            .collect();
+        assert_eq!(args, vec!["{}", "{}"]);
+    }
+
+    #[test]
+    fn parse_completion_rejects_tool_call_missing_id_or_name() {
+        let missing_id = json!({
+            "choices": [{
+                "message": {"tool_calls": [
+                    {"id": "call_ok", "function": {"name": "calc", "arguments": "{}"}},
+                    {"function": {"name": "broken"}}
+                ]}
+            }]
+        });
+        let err = parse_completion(
+            &ProviderId::new("opencode"),
+            &ModelId::new("m"),
+            &missing_id,
+        )
+        .expect_err("missing id must fail loudly");
+        assert!(matches!(err, AiError::Validation(_)), "{err:?}");
+        assert!(
+            err.to_string().contains("tool_calls[1] missing id"),
+            "{err}"
+        );
+
+        let missing_name = json!({
+            "choices": [{
+                "message": {"tool_calls": [
+                    {"id": "call_broken", "function": {"arguments": "{}"}}
+                ]}
+            }]
+        });
+        let err = parse_completion(
+            &ProviderId::new("opencode"),
+            &ModelId::new("m"),
+            &missing_name,
+        )
+        .expect_err("missing name must fail loudly");
+        assert!(matches!(err, AiError::Validation(_)), "{err:?}");
+        assert!(
+            err.to_string().contains("tool_calls[0] missing name"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn user_audio_url_part_is_rejected_at_construction() {
+        let messages = vec![Message::new(
+            Role::User,
+            vec![
+                ContentPart::text("listen:"),
+                ContentPart::Audio {
+                    audio: ai_types::AudioSource::Url {
+                        url: "https://example.com/clip.wav".to_string(),
+                    },
+                },
+            ],
+        )];
+        let err = serialize_messages(&messages).expect_err("audio URL must be rejected");
+        assert!(matches!(err, AiError::Validation(_)), "{err:?}");
+        assert!(
+            err.to_string()
+                .contains("audio input by URL is not supported by this adapter"),
+            "{err}"
         );
     }
 }

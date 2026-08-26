@@ -203,6 +203,27 @@ fn parse_json_args(arguments: &str) -> Value {
     serde_json::from_str(arguments).unwrap_or_else(|_| Value::String(arguments.to_string()))
 }
 
+/// Fallback context window when a model entry omits `inputTokenLimit`.
+const DEFAULT_CONTEXT_WINDOW: u64 = 1_000_000;
+/// Fallback max output tokens when a model entry omits `outputTokenLimit`.
+const DEFAULT_MAX_OUTPUT_TOKENS: u64 = 8_192;
+
+/// Upper bound on pages followed in `models.list` pagination so an endless
+/// `nextPageToken` chain cannot extend the walk indefinitely.
+const MAX_MODEL_PAGES: usize = 10;
+
+/// Maps a raw Gemini `finishReason` (`STOP`, `MAX_TOKENS`, `SAFETY`, …) to
+/// the unified lowercase form so downstream matching is case-stable.
+fn normalize_finish_reason(reason: &str) -> String {
+    reason.to_lowercase()
+}
+
+/// Synthesizes the tool-call id for the `call_index`-th call of a response,
+/// unique even when several parallel calls target the same tool name.
+fn synthesized_call_id(call_index: u64, name: &str) -> String {
+    format!("gemini-{call_index}-{name}")
+}
+
 fn serialize_parts(message: &Message) -> Result<Vec<Value>, AiError> {
     let mut parts: Vec<Value> = Vec::new();
     let text = message.text_content();
@@ -251,6 +272,7 @@ fn parse_generate_response(
 
     let mut text = String::new();
     let mut tool_calls = Vec::new();
+    let mut call_counter: u64 = 0;
     let mut finish_reason = candidate
         .get("finishReason")
         .and_then(|r| r.as_str())
@@ -267,8 +289,9 @@ fn parse_generate_response(
             if let Some(call) = part.get("functionCall") {
                 let name = call.get("name").and_then(|n| n.as_str()).unwrap_or("");
                 let args = call.get("args").cloned().unwrap_or(Value::Null);
+                call_counter += 1;
                 tool_calls.push(ToolCall {
-                    id: format!("gemini-{name}"),
+                    id: synthesized_call_id(call_counter, name),
                     name: name.to_string(),
                     arguments: serde_json::to_string(&args).unwrap_or_else(|_| "{}".into()),
                 });
@@ -309,7 +332,14 @@ fn parse_generate_response(
 }
 
 /// Converts Gemini SSE chunks (`data: {...}`) into unified events.
+///
+/// Every chunk carries complete parts: text deltas pass through, and each
+/// `functionCall` part emits Started → Delta → Completed under one
+/// synthesized id (monotonic per stream, so same-name parallel calls stay
+/// distinct). A `data:` line that is not valid JSON aborts the stream with a
+/// serialization error instead of being skipped silently.
 fn map_gemini_sse(sse: ai_stream::SseStream) -> EventStream {
+    let mut call_counter: u64 = 0;
     let stream = sse.flat_map(move |sse_result| {
         let mut out: Vec<Result<StreamEvent, AiError>> = Vec::new();
         match sse_result {
@@ -319,7 +349,13 @@ fn map_gemini_sse(sse: ai_stream::SseStream) -> EventStream {
                     return futures::stream::iter(out);
                 }
                 let Ok(payload) = serde_json::from_str::<Value>(&event.data) else {
-                    return futures::stream::iter(out); // non-JSON lines skipped
+                    out.push(Err(AiError::Serialization(SerializationError::new(
+                        format!(
+                            "invalid Gemini SSE payload: {}",
+                            event.data.get(..200).unwrap_or(event.data.as_str())
+                        ),
+                    ))));
+                    return futures::stream::iter(out);
                 };
                 if let Some(candidates) = payload.get("candidates").and_then(|c| c.as_array()) {
                     if let Some(candidate) = candidates.first() {
@@ -338,16 +374,26 @@ fn map_gemini_sse(sse: ai_stream::SseStream) -> EventStream {
                                 if let Some(call) = part.get("functionCall") {
                                     let name =
                                         call.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                                    let args = call.get("args").cloned().unwrap_or(Value::Null);
-                                    let id = format!("gemini-{name}");
+                                    let arguments = serde_json::to_string(
+                                        &call.get("args").cloned().unwrap_or(Value::Null),
+                                    )
+                                    .unwrap_or_else(|_| "{}".into());
+                                    call_counter += 1;
+                                    let id = synthesized_call_id(call_counter, name);
                                     out.push(Ok(StreamEvent::ToolCallStarted {
                                         id: id.clone(),
                                         name: name.to_string(),
                                     }));
                                     out.push(Ok(StreamEvent::ToolCallDelta {
-                                        id,
-                                        arguments_delta: serde_json::to_string(&args)
-                                            .unwrap_or_else(|_| "{}".into()),
+                                        id: id.clone(),
+                                        arguments_delta: arguments.clone(),
+                                    }));
+                                    out.push(Ok(StreamEvent::ToolCallCompleted {
+                                        call: ToolCall {
+                                            id,
+                                            name: name.to_string(),
+                                            arguments,
+                                        },
                                     }));
                                 }
                             }
@@ -355,7 +401,7 @@ fn map_gemini_sse(sse: ai_stream::SseStream) -> EventStream {
                         if let Some(reason) = candidate.get("finishReason").and_then(|r| r.as_str())
                         {
                             out.push(Ok(StreamEvent::Completed {
-                                finish_reason: Some(reason.to_string()),
+                                finish_reason: Some(normalize_finish_reason(reason)),
                             }));
                         }
                     }
@@ -384,6 +430,87 @@ fn map_gemini_sse(sse: ai_stream::SseStream) -> EventStream {
     Box::pin(stream)
 }
 
+/// Converts one `models.list` entry into [`ModelInfo`].
+///
+/// Token limits map from `inputTokenLimit`/`outputTokenLimit` with defaults
+/// when absent. Embedding support is claimed only for embedding methods; no
+/// structured-output or vision claim is made because the listing endpoint
+/// exposes no signal for either.
+fn model_from_entry(entry: &Value) -> Option<ModelInfo> {
+    let api_name = entry.get("name").and_then(|n| n.as_str())?;
+    let id = api_name.rsplit('/').next().unwrap_or(api_name);
+    let has_method = |needle: &str| {
+        entry
+            .get("supportedGenerationMethods")
+            .and_then(|m| m.as_array())
+            .is_some_and(|ms| ms.iter().any(|m| m.as_str() == Some(needle)))
+    };
+    let context_window = entry
+        .get("inputTokenLimit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(DEFAULT_CONTEXT_WINDOW);
+    let max_output_tokens = entry
+        .get("outputTokenLimit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS);
+    Some(
+        ModelInfo::new(
+            ProviderId::new("google"),
+            ModelId::new(id),
+            context_window,
+            max_output_tokens,
+        )
+        .with_name(id)
+        .with_capabilities(ModelCapabilities {
+            input_modalities: vec![ai_types::Modality::Text, ai_types::Modality::Image],
+            output_modalities: vec![ai_types::Modality::Text],
+            supports_streaming: has_method("streamGenerateContent"),
+            supports_tools: has_method("generateContent"),
+            supports_structured_output: false,
+            supports_embeddings: has_method("embedContent") || has_method("embedText"),
+            supports_vision: false,
+            supports_fine_tuning: false,
+        }),
+    )
+}
+
+/// Parses one `models.list` page into [`ModelInfo`]s plus the continuation
+/// token (`nextPageToken`) to send as `pageToken` on the next request.
+fn parse_models_page(json: &Value) -> (Vec<ModelInfo>, Option<String>) {
+    let models = json
+        .get("models")
+        .and_then(|m| m.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let infos = models.iter().filter_map(model_from_entry).collect();
+    let next = json
+        .get("nextPageToken")
+        .and_then(|t| t.as_str())
+        .map(str::to_string);
+    (infos, next)
+}
+
+/// Walks `models.list` pages through `fetch_page`, passing each page's
+/// continuation token as the next request's `pageToken`, until a page has no
+/// `nextPageToken` or [`MAX_MODEL_PAGES`] requests have been made.
+async fn collect_model_pages<F, Fut>(mut fetch_page: F) -> Result<Vec<ModelInfo>, AiError>
+where
+    F: FnMut(Option<String>) -> Fut,
+    Fut: std::future::Future<Output = Result<(Vec<ModelInfo>, Option<String>), AiError>>,
+{
+    let mut models = Vec::new();
+    let mut page_token: Option<String> = None;
+    for _ in 0..MAX_MODEL_PAGES {
+        let (page, next) = fetch_page(page_token.take()).await?;
+        models.extend(page);
+        match next {
+            Some(token) => page_token = Some(token),
+            None => break,
+        }
+    }
+    Ok(models)
+}
+
 #[async_trait]
 impl Provider for GeminiProvider {
     fn id(&self) -> &str {
@@ -391,79 +518,44 @@ impl Provider for GeminiProvider {
     }
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>, AiError> {
-        let response = tokio::time::timeout(
-            self.config.timeout,
-            self.http.execute(
-                self.http
-                    .get(format!(
-                        "{}/models",
-                        self.config.base_url.trim_end_matches('/')
-                    ))
-                    .header("x-goog-api-key", &self.config.api_key),
-            ),
-        )
-        .await
-        .map_err(|_| {
-            AiError::Timeout(ai_errors::TimeoutError::new(
-                "google.models",
-                self.config.timeout,
-            ))
-        })?
-        .map_err(|e| map_reqwest_error("google.models", e))?;
-
-        let status = response.status();
-        let retry_after = retry_after_from_headers(response.headers());
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|e| map_reqwest_error("google.models", e))?
-            .to_vec();
-        if !status.is_success() {
-            return Err(map_response_error("google", status, retry_after, &bytes).await);
-        }
-        let json: Value = parse_json("google.models", &bytes)?;
-        let models = json
-            .get("models")
-            .and_then(|m| m.as_array())
-            .cloned()
-            .unwrap_or_default();
-        Ok(models
-            .into_iter()
-            .filter_map(|m| {
-                let name = m.get("name").and_then(|n| n.as_str())?;
-                let id = name.rsplit('/').next().unwrap_or(name);
-                let supported = m
-                    .get("supportedGenerationMethods")
-                    .and_then(|s| s.as_array())
-                    .cloned()
-                    .unwrap_or_default();
-                let supports_streaming = supported
-                    .iter()
-                    .any(|s| s.as_str() == Some("streamGenerateContent"));
-                let supports_tools = supported
-                    .iter()
-                    .any(|s| s.as_str() == Some("generateContent"));
-                Some(
-                    ModelInfo::new(
-                        ProviderId::new("google"),
-                        ModelId::new(id),
-                        1_000_000,
-                        8_192,
-                    )
-                    .with_name(id)
-                    .with_capabilities(ModelCapabilities {
-                        input_modalities: vec![ai_types::Modality::Text, ai_types::Modality::Image],
-                        output_modalities: vec![ai_types::Modality::Text],
-                        supports_streaming,
-                        supports_tools,
-                        supports_structured_output: true,
-                        supports_embeddings: true,
-                        supports_vision: true,
-                        supports_fine_tuning: false,
-                    }),
+        let http = self.http.clone();
+        let base_url = self.config.base_url.trim_end_matches('/').to_string();
+        let api_key = self.config.api_key.clone();
+        let timeout = self.config.timeout;
+        collect_model_pages(move |page_token| {
+            let http = http.clone();
+            let base_url = base_url.clone();
+            let api_key = api_key.clone();
+            async move {
+                let mut request = http.get(format!("{base_url}/models"));
+                if let Some(token) = page_token {
+                    request = request.query(&[("pageToken", token)]);
+                }
+                let response = tokio::time::timeout(
+                    timeout,
+                    http.execute(request.header("x-goog-api-key", api_key)),
                 )
-            })
-            .collect())
+                .await
+                .map_err(|_| {
+                    AiError::Timeout(ai_errors::TimeoutError::new("google.models", timeout))
+                })?
+                .map_err(|e| map_reqwest_error("google.models", e))?;
+
+                let status = response.status();
+                let retry_after = retry_after_from_headers(response.headers());
+                let bytes = response
+                    .bytes()
+                    .await
+                    .map_err(|e| map_reqwest_error("google.models", e))?
+                    .to_vec();
+                if !status.is_success() {
+                    return Err(map_response_error("google", status, retry_after, &bytes).await);
+                }
+                let json: Value = parse_json("google.models", &bytes)?;
+                Ok(parse_models_page(&json))
+            }
+        })
+        .await
     }
 
     fn model(&self, model_id: &str) -> Result<Arc<dyn Model>, AiError> {
@@ -715,5 +807,234 @@ mod tests {
         )]);
         let err = build_generate_body(&request).unwrap_err();
         assert!(err.to_string().contains("inline"), "{err}");
+    }
+
+    #[test]
+    fn generate_response_ids_are_unique_across_same_name_calls() {
+        let json = json!({
+            "candidates": [{
+                "content": {"role": "model", "parts": [
+                    {"functionCall": {"name": "lookup", "args": {"q": "a"}}},
+                    {"functionCall": {"name": "lookup", "args": {"q": "b"}}}
+                ]}
+            }]
+        });
+        let completion = parse_generate_response(
+            &ProviderId::new("google"),
+            &ModelId::new("gemini-1.5-pro"),
+            &json,
+        )
+        .unwrap();
+        assert_eq!(completion.tool_calls[0].id, "gemini-1-lookup");
+        assert_eq!(completion.tool_calls[1].id, "gemini-2-lookup");
+    }
+
+    #[tokio::test]
+    async fn emits_completed_with_matching_id_for_function_call() {
+        let chunks = vec![
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"calculator\",\"args\":{\"expression\":\"6 * 7\"}}}]},\"finishReason\":\"STOP\"}]}\n\n",
+        ];
+        let input = futures::stream::iter(
+            chunks
+                .into_iter()
+                .map(|c| Ok::<bytes::Bytes, AiError>(bytes::Bytes::from(c))),
+        );
+        let events: Vec<StreamEvent> = map_gemini_sse(ai_stream::sse_parse(input))
+            .map(|e| e.unwrap())
+            .collect()
+            .await;
+
+        assert!(
+            matches!(&events[0], StreamEvent::ToolCallStarted { id, name }
+                if id == "gemini-1-calculator" && name == "calculator"),
+            "{events:?}"
+        );
+        assert!(
+            matches!(&events[1], StreamEvent::ToolCallDelta { id, .. } if id == "gemini-1-calculator"),
+            "{events:?}"
+        );
+        match &events[2] {
+            StreamEvent::ToolCallCompleted { call } => {
+                assert_eq!(call.id, "gemini-1-calculator");
+                assert_eq!(call.name, "calculator");
+                assert!(call.arguments.contains("6 * 7"));
+            }
+            other => panic!("expected ToolCallCompleted, got {other:?}"),
+        }
+        // Finish reasons are normalized to lowercase.
+        assert!(
+            matches!(&events[3], StreamEvent::Completed { finish_reason }
+                if finish_reason.as_deref() == Some("stop")),
+            "{events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn parallel_same_name_streamed_calls_get_distinct_ids() {
+        let chunks = vec![
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"lookup\",\"args\":{\"q\":1}}},{\"functionCall\":{\"name\":\"lookup\",\"args\":{\"q\":2}}}]}}]}\n\n",
+        ];
+        let input = futures::stream::iter(
+            chunks
+                .into_iter()
+                .map(|c| Ok::<bytes::Bytes, AiError>(bytes::Bytes::from(c))),
+        );
+        let events: Vec<StreamEvent> = map_gemini_sse(ai_stream::sse_parse(input))
+            .map(|e| e.unwrap())
+            .collect()
+            .await;
+
+        let started_ids: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ToolCallStarted { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        let completed_ids: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ToolCallCompleted { call } => Some(call.id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(started_ids, ["gemini-1-lookup", "gemini-2-lookup"]);
+        assert_eq!(completed_ids, started_ids);
+    }
+
+    #[tokio::test]
+    async fn malformed_data_line_yields_serialization_error() {
+        let chunks = vec![
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"ok\"}]}}]}\n\n",
+            "data: {{{definitely not json\n\n",
+        ];
+        let input = futures::stream::iter(
+            chunks
+                .into_iter()
+                .map(|c| Ok::<bytes::Bytes, AiError>(bytes::Bytes::from(c))),
+        );
+        let results: Vec<Result<StreamEvent, AiError>> =
+            map_gemini_sse(ai_stream::sse_parse(input)).collect().await;
+        assert!(results[0].is_ok());
+        let err = results
+            .iter()
+            .filter_map(|r| r.as_ref().err())
+            .next()
+            .expect("malformed data line must error");
+        assert!(matches!(err, AiError::Serialization(_)), "{err:?}");
+        let message = err.to_string();
+        assert!(message.contains("invalid Gemini SSE payload"), "{message}");
+        assert!(message.contains("not json"), "{message}");
+    }
+
+    #[test]
+    fn finish_reasons_normalize_to_lowercase() {
+        for (raw, expected) in [
+            ("STOP", "stop"),
+            ("MAX_TOKENS", "max_tokens"),
+            ("SAFETY", "safety"),
+        ] {
+            assert_eq!(normalize_finish_reason(raw), expected);
+        }
+    }
+
+    #[test]
+    fn parses_model_page_metadata_honestly() {
+        let (models, next) = parse_models_page(&json!({
+            "models": [
+                {
+                    "name": "models/gemini-2.0-flash",
+                    "inputTokenLimit": 1_048_576,
+                    "outputTokenLimit": 8_192,
+                    "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]
+                },
+                {
+                    "name": "models/text-embedding-004",
+                    "inputTokenLimit": 2_048,
+                    "supportedGenerationMethods": ["embedContent"]
+                },
+                {"name": "models/minimal"}
+            ],
+            "nextPageToken": "cursor"
+        }));
+        assert_eq!(next.as_deref(), Some("cursor"));
+
+        let flash = &models[0];
+        assert_eq!(flash.context_window, 1_048_576);
+        assert_eq!(flash.max_output_tokens, 8_192);
+        assert!(flash.capabilities.supports_streaming);
+        assert!(flash.capabilities.supports_tools);
+        assert!(!flash.capabilities.supports_structured_output);
+        assert!(!flash.capabilities.supports_embeddings);
+        assert!(!flash.capabilities.supports_vision);
+
+        let embedding = &models[1];
+        assert_eq!(embedding.context_window, 2_048);
+        assert_eq!(embedding.max_output_tokens, 8_192);
+        assert!(embedding.capabilities.supports_embeddings);
+        assert!(!embedding.capabilities.supports_tools);
+        assert!(!embedding.capabilities.supports_structured_output);
+
+        let minimal = &models[2];
+        assert_eq!(minimal.context_window, 1_000_000);
+        assert_eq!(minimal.max_output_tokens, 8_192);
+        assert!(!minimal.capabilities.supports_streaming);
+    }
+
+    #[tokio::test]
+    async fn model_pagination_follows_next_page_token_then_stops() {
+        use std::sync::Mutex;
+        let served = vec![
+            json!({"models": [{"name": "models/gemini-page-a"}], "nextPageToken": "cursor-2"}),
+            json!({"models": [{"name": "models/gemini-page-b"}]}),
+        ];
+        let requested: std::sync::Arc<Mutex<Vec<Option<String>>>> =
+            std::sync::Arc::new(Mutex::new(Vec::new()));
+        let requested_in_fetch = std::sync::Arc::clone(&requested);
+        let fetch = move |token: Option<String>| {
+            let served = served.clone();
+            let requested = std::sync::Arc::clone(&requested_in_fetch);
+            async move {
+                let index = requested.lock().unwrap().len();
+                requested.lock().unwrap().push(token);
+                Ok(parse_models_page(&served[index]))
+            }
+        };
+
+        let models = collect_model_pages(fetch).await.unwrap();
+
+        assert_eq!(
+            *requested.lock().unwrap(),
+            vec![None, Some("cursor-2".to_string())]
+        );
+        let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["gemini-page-a", "gemini-page-b"]);
+    }
+
+    #[tokio::test]
+    async fn model_pagination_caps_at_ten_pages() {
+        use std::sync::Mutex;
+        let requests: std::sync::Arc<Mutex<usize>> = std::sync::Arc::new(Mutex::new(0));
+        let requests_in_fetch = std::sync::Arc::clone(&requests);
+        let fetch = move |_token: Option<String>| {
+            let requests = std::sync::Arc::clone(&requests_in_fetch);
+            async move {
+                *requests.lock().unwrap() += 1;
+                Ok((
+                    vec![ModelInfo::new(
+                        ProviderId::new("google"),
+                        ModelId::new("m"),
+                        1,
+                        1,
+                    )],
+                    Some("more".to_string()),
+                ))
+            }
+        };
+
+        let models = collect_model_pages(fetch).await.unwrap();
+
+        assert_eq!(*requests.lock().unwrap(), MAX_MODEL_PAGES);
+        assert_eq!(models.len(), MAX_MODEL_PAGES);
     }
 }

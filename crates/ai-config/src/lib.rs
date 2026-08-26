@@ -8,6 +8,10 @@
 //!
 //! Secrets are never printed by this crate; [`Config::redacted_summary`]
 //! masks API keys.
+//!
+//! There are deliberately no timeout or retry knobs here: per-call timeouts
+//! are constructor constants on the provider adapters today (15/30/60 s), and
+//! this SDK does not perform automatic retries.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -40,14 +44,7 @@ pub mod env_keys {
     /// applications and agents can budget prompts without hardcoding.
     pub const PRIMARY_MODEL_CONTEXT_LENGTH: &str = "AI_SDK_PRIMARY_MODEL_CONTEXT_LENGTH";
     pub const CONFIG_FILE: &str = "AI_SDK_CONFIG";
-    pub const DEFAULT_TIMEOUT: &str = "AI_SDK_DEFAULT_TIMEOUT";
-    pub const DEFAULT_MAX_RETRIES: &str = "AI_SDK_MAX_RETRIES";
 }
-
-/// Default timeout for provider calls (30 s).
-pub const DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-/// Default retry count for transient failures.
-pub const DEFAULT_MAX_RETRIES: u32 = 2;
 
 /// Per-provider configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -90,37 +87,10 @@ impl ProviderConfig {
     }
 }
 
-/// Global defaults for calls.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CallDefaults {
-    #[serde(default = "default_timeout_secs")]
-    pub timeout_secs: u64,
-    #[serde(default = "default_max_retries")]
-    pub max_retries: u32,
-}
-
-fn default_timeout_secs() -> u64 {
-    DEFAULT_TIMEOUT.as_secs()
-}
-
-fn default_max_retries() -> u32 {
-    DEFAULT_MAX_RETRIES
-}
-
-impl Default for CallDefaults {
-    fn default() -> Self {
-        Self {
-            timeout_secs: default_timeout_secs(),
-            max_retries: default_max_retries(),
-        }
-    }
-}
-
-/// File-based configuration schema (`ai-sdk.toml`).
+/// File-based configuration schema (`ai-sdk.toml`). Legacy `[defaults]`
+/// tables with timeout/retry knobs are ignored (unknown fields).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct FileConfig {
-    #[serde(default)]
-    pub defaults: Option<CallDefaults>,
     #[serde(default)]
     pub providers: HashMap<String, ProviderConfig>,
 }
@@ -129,7 +99,6 @@ pub struct FileConfig {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Config {
     pub providers: HashMap<String, ProviderConfig>,
-    pub defaults: CallDefaults,
     /// Provider used when a model reference has no provider prefix
     /// (`AI_SDK_PROVIDER`).
     pub default_provider: Option<String>,
@@ -193,9 +162,6 @@ impl Config {
 
     /// Merges file values into this config (does not override existing keys).
     pub fn merge_file(&mut self, file: FileConfig) {
-        if let Some(defaults) = file.defaults {
-            self.defaults = defaults;
-        }
         for (name, pc) in file.providers {
             self.providers.entry(name).or_insert(pc);
         }
@@ -233,18 +199,6 @@ impl Config {
                     entry.api_key = Some(key);
                 }
             }
-        }
-        if let Some(secs) = std::env::var(env_keys::DEFAULT_TIMEOUT)
-            .ok()
-            .and_then(|v| v.parse().ok())
-        {
-            self.defaults.timeout_secs = secs;
-        }
-        if let Some(retries) = std::env::var(env_keys::DEFAULT_MAX_RETRIES)
-            .ok()
-            .and_then(|v| v.parse().ok())
-        {
-            self.defaults.max_retries = retries;
         }
         // Model/provider selection.
         if let Some(p) = non_empty_env(env_keys::DEFAULT_PROVIDER) {
@@ -311,10 +265,7 @@ impl Config {
             })
             .collect::<Vec<_>>()
             .join(", ");
-        format!(
-            "providers: [{providers}]; timeout: {}s; max_retries: {}",
-            self.defaults.timeout_secs, self.defaults.max_retries
-        )
+        format!("providers: [{providers}]")
     }
 }
 
@@ -348,6 +299,10 @@ pub fn mask_key(key: &str) -> String {
 mod tests {
     use super::*;
 
+    /// Env-var tests mutate process-global state; serialize them so concurrent
+    /// tests cannot observe each other's half-set variables.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn mask_key_obfuscates_middle() {
         assert_eq!(mask_key("sk-abcdefghijklmnop"), "sk-a…mnop");
@@ -375,10 +330,6 @@ mod tests {
         std::fs::write(
             &path,
             r#"
-[defaults]
-timeout_secs = 60
-max_retries = 3
-
 [providers.openai]
 api_key = "sk-file-key"
 default_model = "gpt-4o"
@@ -386,7 +337,6 @@ default_model = "gpt-4o"
         )
         .unwrap();
         let fc = Config::load_file(&path).unwrap();
-        assert_eq!(fc.defaults.as_ref().unwrap().timeout_secs, 60);
         assert_eq!(
             fc.providers.get("openai").unwrap().api_key.as_deref(),
             Some("sk-file-key")
@@ -396,6 +346,31 @@ default_model = "gpt-4o"
             Some("gpt-4o")
         );
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn merge_env_ignores_removed_timeout_and_retry_variables() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        // These knobs were removed: timeouts are constructor constants on the
+        // adapters and this SDK performs no retries. Setting the legacy
+        // variables must be inert.
+        let mut before = Config::default();
+        before.merge_env();
+
+        for (key, value) in [("AI_SDK_DEFAULT_TIMEOUT", "5"), ("AI_SDK_MAX_RETRIES", "9")] {
+            unsafe { std::env::set_var(key, value) };
+        }
+
+        let mut after = Config::default();
+        after.merge_env();
+        assert_eq!(
+            after, before,
+            "legacy timeout/retry variables must be inert"
+        );
+
+        for key in ["AI_SDK_DEFAULT_TIMEOUT", "AI_SDK_MAX_RETRIES"] {
+            unsafe { std::env::remove_var(key) };
+        }
     }
 
     #[test]
@@ -423,6 +398,7 @@ default_model = "gpt-4o"
 
     #[test]
     fn merge_env_reads_provider_model_and_context_length() {
+        let _guard = ENV_LOCK.lock().unwrap();
         // SAFETY (test-only): single-threaded mutation of these specific
         // variables; removed afterwards so other tests are unaffected.
         // (set_var/remove_var are unsafe as of edition 2024.)
