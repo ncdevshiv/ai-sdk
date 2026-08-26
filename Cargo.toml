@@ -25,6 +25,7 @@ members = [
     "crates/ai-edge",
     "crates/ai-voice",
     "crates/ai-cli",
+    "crates/ai-sidecar",
     "crates/ai-computer",
     "crates/ai-sdk",
     "crates/ai-orchestra",

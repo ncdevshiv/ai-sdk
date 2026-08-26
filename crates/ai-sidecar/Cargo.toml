@@ -1,0 +1,29 @@
+[package]
+name = "ai-sidecar"
+description = "AI SDK stdio JSON-RPC sidecar: drives providers and streaming completions from another process"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+ai-core = { path = "../ai-core" }
+ai-config = { path = "../ai-config" }
+ai-errors = { path = "../ai-errors" }
+ai-models = { path = "../ai-models" }
+ai-providers = { path = "../ai-providers" }
+ai-types = { path = "../ai-types" }
+async-trait.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+toml.workspace = true
+
+[[bin]]
+name = "ai-sidecar"
+path = "src/main.rs"

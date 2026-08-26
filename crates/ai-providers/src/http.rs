@@ -398,9 +398,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shared_pool_reuses_connections_across_requests() {
+    async fn pool_reuses_connections_across_sequential_requests() {
+        // An isolated client keeps the request/in-flight counters local to
+        // this test; other tests may exercise the process-wide shared pool
+        // concurrently (`shared_returns_the_same_pool_everywhere` separately
+        // pins the shared singleton's identity).
         let (base_url, connections) = spawn_echo_server();
-        let client = HttpClient::shared();
+        let client = HttpClient::new().unwrap();
         for _ in 0..5 {
             let builder = client
                 .post(format!("{base_url}/chat/completions"))

@@ -1,10 +1,12 @@
 //! Anthropic native adapter (Messages API): real wire format with
 //! `x-api-key` + `anthropic-version` headers, tool use blocks, prompt
-//! caching passthrough, and SSE streaming via `content_block_*` events.
+//! caching passthrough, SSE streaming via `content_block_*` events, and a
+//! live paginated listing over the `/v1/models` endpoint.
 //!
 //! Requires `ANTHROPIC_API_KEY`. Untested live without credentials
 //! (documented); unit tests cover the wire shapes.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,7 +15,7 @@ use futures::StreamExt;
 use serde_json::{Value, json};
 
 use ai_core::{ChatRequest, EventStream, Model, Provider, ResponseFormat};
-use ai_errors::{AiError, SerializationError};
+use ai_errors::{AiError, ProviderError, SerializationError};
 use ai_models::{ModelCapabilities, ModelInfo};
 use ai_types::{
     Completion, ContentPart, Message, ModelId, ProviderId, Role, StreamEvent, ToolCall, Usage,
@@ -29,6 +31,15 @@ use crate::http::{
 pub const ANTHROPIC_VERSION: &str = "2023-06-01";
 /// The Messages API path.
 pub const MESSAGES_PATH: &str = "v1/messages";
+/// The Models API path (paginated model listing).
+pub const MODELS_PATH: &str = "v1/models";
+/// Hard cap on listing pages fetched per `list_models` call, guarding against
+/// an endpoint that never clears `has_more`.
+const MODEL_LISTING_MAX_PAGES: usize = 10;
+/// Context window reported for every listed Anthropic model.
+const MODEL_CONTEXT_WINDOW: u64 = 200_000;
+/// Maximum output tokens reported for every listed Anthropic model.
+const MODEL_MAX_OUTPUT_TOKENS: u64 = 8_192;
 
 /// Configuration for the Anthropic provider.
 #[derive(Debug, Clone)]
@@ -82,6 +93,13 @@ impl AnthropicProvider {
             config,
             http: HttpClient::shared(),
         })
+    }
+
+    /// Overrides the HTTP pool, e.g. with [`HttpClient::new`] so tests get
+    /// their own counters instead of sharing the process-wide one.
+    pub fn with_http_client(mut self, http: HttpClient) -> Self {
+        self.http = http;
+        self
     }
 
     fn url(&self, path: &str) -> String {
@@ -369,10 +387,34 @@ fn parse_messages_response(
     })
 }
 
+/// Computes the query string for the next `/v1/models` listing page.
+///
+/// Returns `None` when pagination is complete (`has_more` is false), when the
+/// response omits `last_id` (no cursor to continue from), or when the new
+/// cursor equals the cursor already sent (`after`) — repeating it would fetch
+/// the same page forever.
+fn next_page_params(has_more: bool, last_id: Option<&str>, after: Option<&str>) -> Option<String> {
+    if !has_more {
+        return None;
+    }
+    let last_id = last_id?;
+    let query = format!("after_id={last_id}");
+    if Some(query.as_str()) == after {
+        return None;
+    }
+    Some(query)
+}
+
 /// Converts Anthropic SSE events into unified stream events.
 fn map_anthropic_sse(sse: ai_stream::SseStream) -> EventStream {
-    // In-flight tool call being streamed: (id, name, accumulated args).
-    let mut in_flight_tool: Option<(String, String, String)> = None;
+    // Tool calls being streamed, keyed by content-block index so parallel
+    // tool_use blocks accumulate their arguments independently.
+    let mut in_flight_tools: BTreeMap<u64, (String, String, String)> = BTreeMap::new();
+    // Usage seen so far: input tokens arrive at `message_start`, output
+    // tokens are updated by each `message_delta`.
+    let mut input_tokens = 0_u64;
+    let mut cached_input_tokens = None;
+    let mut output_tokens = 0_u64;
 
     let stream = sse.flat_map(move |sse_result| {
         let mut out: Vec<Result<StreamEvent, AiError>> = Vec::new();
@@ -391,12 +433,17 @@ fn map_anthropic_sse(sse: ai_stream::SseStream) -> EventStream {
                 let event_type = payload.get("type").and_then(|t| t.as_str()).unwrap_or("");
                 match event_type {
                     "content_block_start" => {
+                        let index = payload.get("index").and_then(|v| v.as_u64());
                         let block = payload.get("content_block").cloned().unwrap_or(Value::Null);
                         if block.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
                             let id = block.get("id").and_then(|v| v.as_str()).unwrap_or("");
                             let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                            in_flight_tool =
-                                Some((id.to_string(), name.to_string(), String::new()));
+                            if let Some(index) = index {
+                                in_flight_tools.insert(
+                                    index,
+                                    (id.to_string(), name.to_string(), String::new()),
+                                );
+                            }
                             out.push(Ok(StreamEvent::ToolCallStarted {
                                 id: id.to_string(),
                                 name: name.to_string(),
@@ -404,6 +451,7 @@ fn map_anthropic_sse(sse: ai_stream::SseStream) -> EventStream {
                         }
                     }
                     "content_block_delta" => {
+                        let index = payload.get("index").and_then(|v| v.as_u64());
                         let delta = payload.get("delta").cloned().unwrap_or(Value::Null);
                         match delta.get("type").and_then(|t| t.as_str()) {
                             Some("text_delta") => {
@@ -424,7 +472,9 @@ fn map_anthropic_sse(sse: ai_stream::SseStream) -> EventStream {
                                 if let Some(partial) =
                                     delta.get("partial_json").and_then(|t| t.as_str())
                                 {
-                                    if let Some((id, _name, args)) = in_flight_tool.as_mut() {
+                                    if let Some((id, _name, args)) =
+                                        index.and_then(|i| in_flight_tools.get_mut(&i))
+                                    {
                                         args.push_str(partial);
                                         out.push(Ok(StreamEvent::ToolCallDelta {
                                             id: id.clone(),
@@ -436,13 +486,36 @@ fn map_anthropic_sse(sse: ai_stream::SseStream) -> EventStream {
                             _ => {}
                         }
                     }
+                    "content_block_stop" => {
+                        // Finalizes the tool_use block at this index; text
+                        // blocks and unknown indexes carry no state here.
+                        if let Some(index) = payload.get("index").and_then(|v| v.as_u64()) {
+                            if let Some((id, name, arguments)) = in_flight_tools.remove(&index) {
+                                out.push(Ok(StreamEvent::ToolCallCompleted {
+                                    call: ai_types::ToolCall {
+                                        id,
+                                        name,
+                                        arguments,
+                                    },
+                                }));
+                            }
+                        }
+                    }
                     "message_delta" => {
+                        if let Some(output) = payload
+                            .pointer("/usage/output_tokens")
+                            .and_then(|v| v.as_u64())
+                        {
+                            output_tokens = output;
+                        }
                         if let Some(reason) = payload
                             .get("delta")
                             .and_then(|d| d.get("stop_reason"))
                             .and_then(|v| v.as_str())
                         {
-                            if let Some((id, name, arguments)) = in_flight_tool.take() {
+                            // Finalize any tool blocks the provider never
+                            // closed explicitly, in block-index order.
+                            for (_, (id, name, arguments)) in std::mem::take(&mut in_flight_tools) {
                                 out.push(Ok(StreamEvent::ToolCallCompleted {
                                     call: ai_types::ToolCall {
                                         id,
@@ -458,24 +531,50 @@ fn map_anthropic_sse(sse: ai_stream::SseStream) -> EventStream {
                     }
                     "message_start" => {
                         if let Some(usage) = payload.pointer("/message/usage") {
+                            input_tokens = usage
+                                .get("input_tokens")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0);
+                            cached_input_tokens = usage
+                                .get("cache_read_input_tokens")
+                                .and_then(|v| v.as_u64());
                             out.push(Ok(StreamEvent::UsageUpdate {
                                 usage: Usage {
-                                    input_tokens: usage
-                                        .get("input_tokens")
-                                        .and_then(|v| v.as_u64())
-                                        .unwrap_or(0),
+                                    input_tokens,
                                     output_tokens: usage
                                         .get("output_tokens")
                                         .and_then(|v| v.as_u64())
                                         .unwrap_or(0),
                                     reasoning_tokens: None,
-                                    cached_input_tokens: usage
-                                        .get("cache_read_input_tokens")
-                                        .and_then(|v| v.as_u64()),
+                                    cached_input_tokens,
                                     total_tokens: None,
                                 },
                             }));
                         }
+                    }
+                    "message_stop" => {
+                        out.push(Ok(StreamEvent::UsageUpdate {
+                            usage: Usage {
+                                input_tokens,
+                                output_tokens,
+                                reasoning_tokens: None,
+                                cached_input_tokens,
+                                total_tokens: None,
+                            },
+                        }));
+                    }
+                    "error" => {
+                        let err_type = payload
+                            .pointer("/error/type")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown");
+                        let message = payload
+                            .pointer("/error/message")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown stream error");
+                        out.push(Err(AiError::Provider(
+                            ProviderError::new("anthropic", message).with_code(err_type),
+                        )));
                     }
                     _ => {}
                 }
@@ -493,35 +592,78 @@ impl Provider for AnthropicProvider {
     }
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>, AiError> {
-        // Anthropic exposes a curated model list; without a documented
-        // public listing endpoint we return the known catalog entries for
-        // this provider.
+        let operation = "anthropic.list_models";
+        let provider = ProviderId::new("anthropic");
         let mut models = Vec::new();
-        for id in [
-            "claude-sonnet-4-20250514",
-            "claude-3-5-sonnet-20241022",
-            "claude-3-opus-20240229",
-            "claude-3-haiku-20240307",
-        ] {
-            models.push(
-                ModelInfo::new(
-                    ProviderId::new("anthropic"),
-                    ModelId::new(id),
-                    200_000,
-                    64_000,
-                )
-                .with_name(id)
-                .with_capabilities(ModelCapabilities {
-                    input_modalities: vec![ai_types::Modality::Text, ai_types::Modality::Image],
-                    output_modalities: vec![ai_types::Modality::Text],
-                    supports_streaming: true,
-                    supports_tools: true,
-                    supports_structured_output: false,
-                    supports_embeddings: false,
-                    supports_vision: true,
-                    supports_fine_tuning: false,
-                }),
+        // Query string of the page just fetched; `None` for the first page.
+        let mut after: Option<String> = None;
+
+        for _ in 0..MODEL_LISTING_MAX_PAGES {
+            let mut url = self.url(MODELS_PATH);
+            if let Some(query) = &after {
+                url.push('?');
+                url.push_str(query);
+            }
+            let response = tokio::time::timeout(
+                self.config.timeout,
+                self.http.execute(
+                    self.http
+                        .get(url)
+                        .header("x-api-key", &self.config.api_key)
+                        .header("anthropic-version", ANTHROPIC_VERSION),
+                ),
+            )
+            .await
+            .map_err(|_| {
+                AiError::Timeout(ai_errors::TimeoutError::new(operation, self.config.timeout))
+            })?
+            .map_err(|e| map_reqwest_error(operation, e))?;
+
+            let status = response.status();
+            let retry_after = retry_after_from_headers(response.headers());
+            let bytes = response
+                .bytes()
+                .await
+                .map_err(|e| map_reqwest_error(operation, e))?
+                .to_vec();
+            if !status.is_success() {
+                return Err(map_response_error("anthropic", status, retry_after, &bytes).await);
+            }
+            let json: Value = parse_json(operation, &bytes)?;
+
+            let data = json.get("data").and_then(|d| d.as_array()).ok_or_else(|| {
+                AiError::Serialization(SerializationError::new("models response missing `data`"))
+            })?;
+            for entry in data {
+                let Some(id) = entry.get("id").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                models.push(
+                    ModelInfo::new(
+                        provider.clone(),
+                        ModelId::new(id),
+                        MODEL_CONTEXT_WINDOW,
+                        MODEL_MAX_OUTPUT_TOKENS,
+                    )
+                    .with_name(
+                        entry
+                            .get("display_name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(id),
+                    ),
+                );
+            }
+
+            after = next_page_params(
+                json.get("has_more")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+                json.get("last_id").and_then(|v| v.as_str()),
+                after.as_deref(),
             );
+            if after.is_none() {
+                break;
+            }
         }
         Ok(models)
     }
@@ -588,6 +730,7 @@ impl Model for AnthropicModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
     fn serializes_tool_calls_and_results() {
@@ -704,5 +847,323 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, StreamEvent::Completed { .. }))
         );
+    }
+
+    #[tokio::test]
+    async fn mid_stream_error_event_surfaces_as_err() {
+        let chunks = vec![
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":0}}}\n\n",
+            "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        ];
+        let input = futures::stream::iter(
+            chunks
+                .into_iter()
+                .map(|c| Ok::<bytes::Bytes, AiError>(bytes::Bytes::from(c))),
+        );
+        let results: Vec<Result<StreamEvent, AiError>> =
+            map_anthropic_sse(sse_parse(input)).collect().await;
+
+        assert!(results[0].is_ok(), "events before the error stay usable");
+        match &results[1] {
+            Err(AiError::Provider(err)) => {
+                assert_eq!(err.code.as_deref(), Some("overloaded_error"));
+                assert_eq!(err.message, "Overloaded");
+            }
+            other => panic!("expected provider error event, got {other:?}"),
+        }
+        // The error aborts the stream: nothing is emitted after it.
+        assert_eq!(results.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn interleaved_tool_blocks_complete_independently() {
+        let chunks = vec![
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call_a\",\"name\":\"weather\"}}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call_b\",\"name\":\"clock\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":9,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"IGNORED\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"city\\\":\\\"\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"tz\\\":\\\"\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"Paris\\\"}\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"UTC\\\"}\"}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":9}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":5}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        ];
+        let input = futures::stream::iter(
+            chunks
+                .into_iter()
+                .map(|c| Ok::<bytes::Bytes, AiError>(bytes::Bytes::from(c))),
+        );
+        let events: Vec<StreamEvent> = map_anthropic_sse(sse_parse(input))
+            .map(|e| e.unwrap())
+            .collect()
+            .await;
+
+        // Deltas are routed to their own block by index.
+        let mut args_a = String::new();
+        let mut args_b = String::new();
+        let started = events
+            .iter()
+            .filter(|e| matches!(e, StreamEvent::ToolCallStarted { .. }))
+            .count();
+        assert_eq!(started, 2);
+        for e in &events {
+            if let StreamEvent::ToolCallDelta {
+                id,
+                arguments_delta,
+            } = e
+            {
+                if id == "call_a" {
+                    args_a.push_str(arguments_delta);
+                } else if id == "call_b" {
+                    args_b.push_str(arguments_delta);
+                }
+            }
+        }
+        assert_eq!(args_a, r#"{"city":"Paris"}"#);
+        assert_eq!(args_b, r#"{"tz":"UTC"}"#);
+
+        // Each block completes at its own content_block_stop with its own
+        // arguments; the unknown index (9) emits nothing.
+        let completed: Vec<&ai_types::ToolCall> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ToolCallCompleted { call } => Some(call),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(completed.len(), 2);
+        assert_eq!(completed[0].id, "call_a");
+        assert_eq!(completed[0].name, "weather");
+        assert_eq!(completed[0].arguments, r#"{"city":"Paris"}"#);
+        assert_eq!(completed[1].id, "call_b");
+        assert_eq!(completed[1].name, "clock");
+        assert_eq!(completed[1].arguments, r#"{"tz":"UTC"}"#);
+
+        // The final UsageUpdate carries message_start input tokens together
+        // with the message_delta output tokens.
+        match events.last() {
+            Some(StreamEvent::UsageUpdate { usage }) => {
+                assert_eq!(usage.input_tokens, 10);
+                assert_eq!(usage.output_tokens, 5);
+            }
+            other => panic!("expected final usage update, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn final_usage_update_carries_message_start_and_delta_totals() {
+        let chunks = vec![
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":25,\"output_tokens\":0,\"cache_read_input_tokens\":4}}}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":17}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        ];
+        let input = futures::stream::iter(
+            chunks
+                .into_iter()
+                .map(|c| Ok::<bytes::Bytes, AiError>(bytes::Bytes::from(c))),
+        );
+        let events: Vec<StreamEvent> = map_anthropic_sse(sse_parse(input))
+            .map(|e| e.unwrap())
+            .collect()
+            .await;
+
+        // Per-event behavior preserved: message_start still yields its own
+        // UsageUpdate immediately.
+        assert!(
+            matches!(&events[0], StreamEvent::UsageUpdate { usage } if usage.input_tokens == 25)
+        );
+        assert!(matches!(&events[1], StreamEvent::TextDelta { .. }));
+        // Text blocks produce no ToolCallCompleted at content_block_stop.
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::ToolCallCompleted { .. }))
+        );
+        match events.last() {
+            Some(StreamEvent::UsageUpdate { usage }) => {
+                assert_eq!(usage.input_tokens, 25);
+                assert_eq!(usage.output_tokens, 17);
+                assert_eq!(usage.cached_input_tokens, Some(4));
+            }
+            other => panic!("expected final usage update, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn next_page_params_walks_pages_then_stops() {
+        // First page carries no cursor; a page with more results continues.
+        assert_eq!(
+            next_page_params(true, Some("claude-b"), None).as_deref(),
+            Some("after_id=claude-b")
+        );
+        // Completion ends pagination regardless of cursor.
+        assert_eq!(
+            next_page_params(false, Some("claude-c"), Some("after_id=claude-b")),
+            None
+        );
+        // A page without last_id cannot be continued.
+        assert_eq!(next_page_params(true, None, None), None);
+        // Repeating the cursor just sent would never advance.
+        assert_eq!(
+            next_page_params(true, Some("claude-b"), Some("after_id=claude-b")),
+            None
+        );
+    }
+
+    /// Builds a full HTTP/1.1 response with a JSON body and `connection:
+    /// close` so each listing request uses its own connection.
+    fn http_response(head: &str, body: &str) -> String {
+        format!(
+            "{head}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// Spawns a minimal local HTTP server that answers each request with the
+    /// next response in `responses` (repeating the last one) and records every
+    /// raw request it receives.
+    async fn spawn_http_server(
+        responses: Vec<String>,
+    ) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        let requests: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let served = Arc::new(AtomicUsize::new(0));
+        let responses = Arc::new(responses);
+        let requests_task = requests.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let responses = responses.clone();
+                let requests = requests_task.clone();
+                let served = served.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        match socket.read(&mut chunk).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                buf.extend_from_slice(&chunk[..n]);
+                                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    requests
+                        .lock()
+                        .unwrap()
+                        .push(String::from_utf8_lossy(&buf).into_owned());
+                    let index = served.fetch_add(1, Ordering::SeqCst);
+                    let response = responses
+                        .get(index)
+                        .or_else(|| responses.last())
+                        .expect("server is spawned with at least one response");
+                    // A client that hung up before reading the response is
+                    // irrelevant to the assertions; drop the connection.
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        (format!("http://{addr}"), requests)
+    }
+
+    #[tokio::test]
+    async fn list_models_drives_pagination_against_local_server() {
+        let page1 = json!({
+            "data": [
+                {"id": "claude-a", "display_name": "Claude A"},
+                {"id": "claude-b", "display_name": "Claude B"}
+            ],
+            "has_more": true,
+            "last_id": "claude-b"
+        })
+        .to_string();
+        let page2 = json!({
+            "data": [{"id": "claude-c", "display_name": "Claude C"}],
+            "has_more": false,
+            "last_id": "claude-c"
+        })
+        .to_string();
+        let (base_url, requests) = spawn_http_server(vec![
+            http_response("HTTP/1.1 200 OK", &page1),
+            http_response("HTTP/1.1 200 OK", &page2),
+        ])
+        .await;
+
+        let mut config = AnthropicConfig::new("test-key");
+        config.base_url = base_url;
+        // Isolated pool: the shared client's request counter is process-wide
+        // and other tests assert on it.
+        let provider = AnthropicProvider::new(config)
+            .unwrap()
+            .with_http_client(HttpClient::new().unwrap());
+        let models = provider.list_models().await.unwrap();
+
+        let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["claude-a", "claude-b", "claude-c"]);
+        assert_eq!(models[0].name, "Claude A");
+        assert_eq!(models[2].name, "Claude C");
+        assert_eq!(models[0].context_window, MODEL_CONTEXT_WINDOW);
+        assert_eq!(models[0].max_output_tokens, MODEL_MAX_OUTPUT_TOKENS);
+
+        let reqs = requests.lock().unwrap();
+        assert_eq!(reqs.len(), 2);
+        // First request: correct path, auth headers, no cursor.
+        assert!(
+            reqs[0].starts_with("GET /v1/models HTTP/1.1"),
+            "{}",
+            reqs[0]
+        );
+        assert!(reqs[0].contains("x-api-key: test-key"), "{}", reqs[0]);
+        assert!(
+            reqs[0].contains(&format!("anthropic-version: {ANTHROPIC_VERSION}")),
+            "{}",
+            reqs[0]
+        );
+        assert!(!reqs[0].contains("after_id"), "{}", reqs[0]);
+        // Second request continues from the first page's last_id.
+        assert!(
+            reqs[1].starts_with("GET /v1/models?after_id=claude-b HTTP/1.1"),
+            "{}",
+            reqs[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn list_models_maps_http_error_responses() {
+        let body = json!({
+            "type": "error",
+            "error": {"type": "authentication_error", "message": "invalid x-api-key"}
+        })
+        .to_string();
+        let (base_url, requests) =
+            spawn_http_server(vec![http_response("HTTP/1.1 401 Unauthorized", &body)]).await;
+
+        let mut config = AnthropicConfig::new("test-key");
+        config.base_url = base_url;
+        let provider = AnthropicProvider::new(config)
+            .unwrap()
+            .with_http_client(HttpClient::new().unwrap());
+
+        let err = provider.list_models().await.unwrap_err();
+        assert!(matches!(err, AiError::Authentication(_)), "{err:?}");
+        // Mapping fails fast on the failed page without further requests.
+        assert_eq!(requests.lock().unwrap().len(), 1);
     }
 }
