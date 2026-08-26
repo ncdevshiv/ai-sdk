@@ -219,6 +219,17 @@ pub const RRF_K: f32 = 60.0;
 /// Each list contributes `1/(k + rank)` to every id it contains (rank 1 =
 /// first). The result is sorted by fused score descending with ids as a
 /// deterministic tie-break; every id appearing in any list is present.
+///
+/// ```
+/// use ai_rag::reciprocal_rank_fusion;
+///
+/// let ranked = reciprocal_rank_fusion(
+///     &[vec!["a".into(), "b".into()], vec!["b".into(), "c".into()]],
+///     ai_rag::RRF_K,
+/// );
+/// // `b` appears first in both lists, so it fuses to the top.
+/// assert_eq!(ranked[0].0, "b");
+/// ```
 pub fn reciprocal_rank_fusion(rankings: &[Vec<String>], k: f32) -> Vec<(String, f32)> {
     let mut scores: HashMap<String, f32> = HashMap::new();
     for ranking in rankings {
