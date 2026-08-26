@@ -76,7 +76,26 @@ async fn evaluate(
     embedder_label: &str,
     embedder: &dyn EmbeddingsProvider,
 ) -> BTreeMap<String, f32> {
-    let raw = std::fs::read_to_string(fixture_path()).expect("fixture file readable");
+    // Windows note: right after a full rebuild, real-time AV scanners can
+    // transiently lock freshly-written files; retry briefly before failing.
+    let raw = {
+        let path = fixture_path();
+        let mut attempt = 0;
+        loop {
+            match std::fs::read_to_string(&path) {
+                Ok(raw) => break raw,
+                Err(e) if attempt < 3 => {
+                    attempt += 1;
+                    eprintln!("fixture read retry {attempt}/3 after {e}");
+                    std::thread::sleep(std::time::Duration::from_millis(150 * attempt as u64));
+                }
+                Err(e) => panic!(
+                    "fixture unreadable: {e}; path={path:?}; cwd={:?}",
+                    std::env::current_dir().unwrap_or_default()
+                ),
+            }
+        }
+    };
     let fx: Fixture = serde_json::from_str(&raw).expect("valid fixture JSON");
 
     // Index = every relevant doc + every distractor.

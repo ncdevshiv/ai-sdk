@@ -2,12 +2,16 @@
 //! permissions, execution IDs/tracing hooks, built-in tools, and a skills
 //! registry (PRD §3.3).
 
+/// Legacy simulated browser tool; superseded by `ai-computer`'s
+/// OmniChrome-backed real browser control.
+#[allow(deprecated)]
 pub mod browser;
 mod builtins;
 mod math;
 mod registry;
 mod schema;
 
+#[allow(deprecated)]
 pub use browser::{BrowserAction, BrowserTool};
 pub use builtins::{HttpTool, MathTool, TimeTool, UuidTool};
 pub use math::evaluate_expression;
@@ -163,6 +167,10 @@ pub fn to_tool_definition(tool: &dyn Tool) -> ai_core::ToolDefinition {
 }
 
 /// All built-in tools as a ready registry.
+///
+/// The simulated `browser_action` remains registered for compatibility —
+/// prefer `ai_computer`'s real browser/desktop plugins in production.
+#[allow(deprecated)]
 pub fn default_tools() -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     registry.register(Arc::new(HttpTool::default()));

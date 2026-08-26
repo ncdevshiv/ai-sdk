@@ -98,6 +98,20 @@ pub struct JsonRpcHttpClient {
     timeout: Duration,
 }
 
+impl Clone for JsonRpcHttpClient {
+    fn clone(&self) -> Self {
+        Self {
+            endpoint: self.endpoint.clone(),
+            token: self.token.clone(),
+            http: self.http.clone(),
+            // Clones continue the id sequence rather than sharing the
+            // counter — ids only need uniqueness per logical stream.
+            next_id: AtomicU64::new(self.next_id.load(Ordering::Relaxed)),
+            timeout: self.timeout,
+        }
+    }
+}
+
 impl JsonRpcHttpClient {
     pub fn new(endpoint: impl Into<String>, token: Option<String>) -> Self {
         Self {

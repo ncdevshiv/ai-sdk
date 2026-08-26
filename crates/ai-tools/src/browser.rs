@@ -33,7 +33,15 @@ pub enum BrowserAction {
 }
 
 /// A tool exposing browser action capabilities to models.
+///
+/// ⚠️ SIMULATED: acknowledges actions without driving any browser. For real
+/// browser control use `ai_computer::omnichrome::BrowserTool` (OmniChrome
+/// CDP bridge).
 #[derive(Debug, Clone)]
+#[deprecated(
+    since = "0.1.0",
+    note = "simulated acknowledgement only; use ai-computer's OmniChrome-backed BrowserTool for real control"
+)]
 pub struct BrowserTool {
     policy: UrlPolicy,
 }
