@@ -350,6 +350,17 @@ impl AiClientBuilder {
         self
     }
 
+    /// Registers a provider adapter under an explicit key, independent of the
+    /// adapter's own id. Hosts that address providers by a caller-chosen
+    /// route name (the sidecar's `configure`) need this when the adapter's
+    /// id differs from the route key — a custom gateway speaking the native
+    /// Anthropic format must stay resolvable as its route, not as
+    /// `anthropic`.
+    pub fn provider_as(mut self, key: impl Into<String>, provider: Arc<dyn Provider>) -> Self {
+        self.providers.insert(key.into(), provider);
+        self
+    }
+
     /// Sets the model registry used for routing metadata (defaults to the
     /// curated catalog).
     pub fn registry(mut self, registry: ModelRegistry) -> Self {

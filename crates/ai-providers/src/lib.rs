@@ -57,6 +57,33 @@ pub fn create_provider(
     }
 }
 
+/// Creates a provider adapter from its id, an explicit wire dialect, and
+/// configuration. `api` names the dialect for routes whose own id cannot —
+/// a custom gateway speaking native Anthropic or Gemini. `None` (or the
+/// OpenAI-compatible family) keeps the historical id-based selection, so an
+/// unknown custom id still lands on the OpenAI-compatible adapter.
+pub fn create_provider_with_api(
+    id: &str,
+    api: Option<&str>,
+    config: &ai_config::ProviderConfig,
+) -> Result<Arc<dyn Provider>, AiError> {
+    match api {
+        Some("anthropic") => Ok(Arc::new(AnthropicProvider::new(
+            AnthropicConfig::from_provider_config(config)?,
+        )?)),
+        Some("google") => Ok(Arc::new(GeminiProvider::new(
+            GeminiConfig::from_provider_config(config)?,
+        )?)),
+        // Naming the family explicitly selects the same adapter the id-based
+        // path would: `openai-compatible` is the default, not a third format.
+        Some("openai-compatible") | None => create_provider(id, config),
+        Some(other) => Err(AiError::Configuration(ConfigurationError::new(
+            "wire-dialect",
+            format!("unknown wire dialect `{other}` for provider `{id}`"),
+        ))),
+    }
+}
+
 /// Builds a provider from a raw id, api key, and base URL (programmatic
 /// configuration path). Native ids route to their native adapters.
 pub fn create_provider_direct(
