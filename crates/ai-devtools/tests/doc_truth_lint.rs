@@ -5,6 +5,9 @@
 //! about behavior that the code does not have. This guards against the
 //! failure mode where documentation drifts into fiction (e.g. advertising a
 //! "Real Browser" integration while `execute()` fabricates success strings).
+//! Conditionally true claims are handled by proof markers: e.g. "real
+//! browser" passes only in files that themselves wire up the real
+//! OmniChrome/CDP bridge (see [`REAL_BROWSER_PROOF_MARKERS`]).
 //!
 //! What counts as scanned source: all crate sources, including doc comments,
 //! regular comments, and string literals. Excluded: integration/bench trees
@@ -37,8 +40,9 @@ const BANNED_RULES: &[Rule] = &[
     Rule {
         name: "real-browser",
         pattern: "real browser",
-        rationale: "browser tooling here is simulated (acknowledgement strings); \
-                    claiming a real browser integration misleads users",
+        rationale: "simulated browser tooling (acknowledgement strings) must not \
+                    claim a real integration; the claim passes only in files that \
+                    prove one (see REAL_BROWSER_PROOF_MARKERS)",
     },
     Rule {
         name: "rrf-style-fusion",
@@ -79,6 +83,18 @@ const BANNED_RULES: &[Rule] = &[
 /// - `/ (rrf_k` / `/(rrf_k` — the characteristic `score = 1/(k + rank)`
 ///   computation.
 const RRF_IMPLEMENTATION_MARKERS: &[&str] = &["fn reciprocal_rank_fusion", "/ (rrf_k", "/(rrf_k"];
+
+/// Textual markers proving a "real browser" claim is TRUE in the same file.
+/// A file mentioning "real browser" passes ONLY if one of these markers is
+/// present, i.e. the file itself wires up the actual integration:
+/// - `omnichrome` — the OmniChrome Chrome-extension CDP bridge client; or
+/// - `cdp` — Chrome DevTools Protocol plumbing.
+///
+/// This exists because `ai-computer` genuinely drives a real browser through
+/// the local OmniChrome bridge, unlike the simulated browser tooling elsewhere
+/// (for which the ban was written). A future file that claims "real browser"
+/// without containing this proof still fails the lint.
+const REAL_BROWSER_PROOF_MARKERS: &[&str] = &["omnichrome", "cdp"];
 
 /// Temporary exceptions: `(path fragment, banned pattern)` pairs tolerated
 /// because the violating file is OUTSIDE this lint's write ownership.
@@ -289,7 +305,12 @@ fn violations_in(rel_path: &str, text: &str) -> Vec<Hit> {
             let abs = from + pos;
             let allowed = ALLOWLIST
                 .iter()
-                .any(|(fragment, pattern)| rel_path.contains(fragment) && *pattern == needle);
+                .any(|(fragment, pattern)| rel_path.contains(fragment) && *pattern == needle)
+                // Evidence-gated claim: "real browser" is tolerated in files
+                // that themselves contain the real-bridge proof markers
+                // (mirrors the conditional RRF handling below).
+                || (rule.name == "real-browser"
+                    && REAL_BROWSER_PROOF_MARKERS.iter().any(|m| lowered.contains(m)));
             if !allowed {
                 hits.push(Hit {
                     rule: rule.name,
