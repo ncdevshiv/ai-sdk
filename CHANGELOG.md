@@ -9,6 +9,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+Sidecar JSON-RPC gateway — 2026-08-26 (`ai-sidecar` crate, NEW):
+
+- stdio NDJSON gateway exposing the SDK to non-Rust hosts:
+  `initialize` / `configure` / `provider.list` / `model.list` /
+  `model.discover` / `model.info` / `chat.generate` / `chat.stream` /
+  `stream.cancel`
+- Protocol hardening: duplicate `stream_id` answers `-32602` instead of
+  orphaning the first pump; frames capped at 16 MiB (oversized frames
+  drained and rejected while the loop keeps serving); bounded,
+  self-removing responders bookkeeping; failed host writes log to
+  stderr instead of disappearing
+- `ai-core`: `AiClientBuilder::provider_as(key, adapter)` registers an
+  adapter under an explicit route key so sidecar `configure` can
+  address providers by caller-chosen names
+- `ai-providers`: explicit wire dialect (`anthropic | google |
+  openai-compatible`) overrides id-based selection; unknown dialects
+  fail loud with a typed configuration error before any network call
+- `ai-providers/anthropic`: real paginated `GET /v1/models` listing
+  (was a hardcoded catalog); cumulative output tokens from
+  `message_delta` reach `UsageUpdate`; parallel `tool_use` blocks
+  tracked per content-block index; mid-stream error events surface as
+  `Err` instead of being silently ignored
+- `ai-providers/gemini`: streaming emits `ToolCallCompleted`;
+  synthesized ids `gemini-{n}-{name}` correlate same-name parallel
+  calls; `list_models` follows `nextPageToken`; finish reasons
+  normalized; malformed SSE data lines return typed errors
+- `ai-providers/openai_compat`: configured `extra_headers` reach every
+  request; `AI_SDK_DEBUG_WIRE` default record is redacted (len+sha256)
+  with `=full` opt-in; missing tool_call id/name rejects loudly; audio-
+  by-URL rejected at construction
+- `ai-config`: removed advertised-but-dead `AI_SDK_DEFAULT_TIMEOUT` /
+  `AI_SDK_MAX_RETRIES` knobs (no consumer ever read them); timeouts are
+  constructor constants and no retries are performed
+
 Native automation plugins — 2026-08-10 (`ai-computer` crate):
 
 - **Browser plugin** (`omnichrome.rs`): `OmniChromeClient` speaks the

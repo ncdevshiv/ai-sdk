@@ -443,7 +443,7 @@ impl Sidecar {
                 let reference = required_string(&params, "reference")?;
                 let request = parse_chat_request(&params)?;
                 let completion = client
-                    .generate_request(&reference, request)
+                    .generate_request(reference, request)
                     .await
                     .map_err(|e| RpcError::provider_failure(&e))?;
                 Ok(serde_json::to_value(completion)
