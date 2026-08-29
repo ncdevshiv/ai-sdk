@@ -91,6 +91,7 @@ pub enum ReasoningEffort {
     Low,
     Medium,
     High,
+    Max,
 }
 
 impl fmt::Display for ReasoningEffort {
@@ -99,6 +100,7 @@ impl fmt::Display for ReasoningEffort {
             Self::Low => "low",
             Self::Medium => "medium",
             Self::High => "high",
+            Self::Max => "max",
         };
         f.write_str(s)
     }

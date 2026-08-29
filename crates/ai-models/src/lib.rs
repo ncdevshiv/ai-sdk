@@ -55,6 +55,16 @@ pub struct ModelInfo {
     pub max_output_tokens: u64,
     #[serde(default)]
     pub capabilities: ModelCapabilities,
+    /// The exact request spelling that disables reasoning/thinking on this
+    /// model, when a discovery run found one (e.g. `thinking.type=disabled`
+    /// or `reasoning_effort=low`).
+    ///
+    /// This is a measured, per-model value: the working spelling differs
+    /// between models on the same provider, and unknown spellings are
+    /// silently ignored by gateways — so callers must use the value they
+    /// were given, never a global guess.
+    #[serde(default)]
+    pub thinking_control: Option<String>,
     #[serde(default)]
     pub pricing: Option<Pricing>,
     /// Extra provider metadata (release date, aliases…).
@@ -76,6 +86,7 @@ impl ModelInfo {
             context_window,
             max_output_tokens,
             capabilities: ModelCapabilities::default(),
+            thinking_control: None,
             pricing: None,
             metadata: BTreeMap::new(),
         }
@@ -94,6 +105,12 @@ impl ModelInfo {
 
     pub fn with_pricing(mut self, pricing: Pricing) -> Self {
         self.pricing = Some(pricing);
+        self
+    }
+
+    /// Builder-style setter for the discovered thinking-toggle spelling.
+    pub fn with_thinking_control(mut self, spelling: impl Into<String>) -> Self {
+        self.thinking_control = Some(spelling.into());
         self
     }
 
