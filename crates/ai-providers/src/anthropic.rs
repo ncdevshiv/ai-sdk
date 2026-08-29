@@ -41,6 +41,36 @@ const MODEL_CONTEXT_WINDOW: u64 = 200_000;
 /// Maximum output tokens reported for every listed Anthropic model.
 const MODEL_MAX_OUTPUT_TOKENS: u64 = 8_192;
 
+/// Catalog-aware ModelInfo builder for Anthropic entries.
+fn anthropic_model_info(id: &str, display_name: Option<&str>) -> ModelInfo {
+    if let Some(catalog_info) = ai_models::default_catalog().get("anthropic", id) {
+        let mut info = catalog_info.clone();
+        if let Some(name) = display_name {
+            if name != id {
+                info.name = name.to_string();
+            }
+        }
+        return info;
+    }
+    ModelInfo::new(
+        ProviderId::new("anthropic"),
+        ModelId::new(id),
+        MODEL_CONTEXT_WINDOW,
+        MODEL_MAX_OUTPUT_TOKENS,
+    )
+    .with_name(display_name.unwrap_or(id))
+    .with_capabilities(ModelCapabilities {
+        input_modalities: vec![ai_types::Modality::Text, ai_types::Modality::Image],
+        output_modalities: vec![ai_types::Modality::Text],
+        supports_streaming: true,
+        supports_tools: true,
+        supports_structured_output: false,
+        supports_embeddings: false,
+        supports_vision: true,
+        supports_fine_tuning: false,
+    })
+}
+
 /// Configuration for the Anthropic provider.
 #[derive(Debug, Clone)]
 pub struct AnthropicConfig {
@@ -593,7 +623,6 @@ impl Provider for AnthropicProvider {
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>, AiError> {
         let operation = "anthropic.list_models";
-        let provider = ProviderId::new("anthropic");
         let mut models = Vec::new();
         // Query string of the page just fetched; `None` for the first page.
         let mut after: Option<String> = None;
@@ -638,20 +667,8 @@ impl Provider for AnthropicProvider {
                 let Some(id) = entry.get("id").and_then(|v| v.as_str()) else {
                     continue;
                 };
-                models.push(
-                    ModelInfo::new(
-                        provider.clone(),
-                        ModelId::new(id),
-                        MODEL_CONTEXT_WINDOW,
-                        MODEL_MAX_OUTPUT_TOKENS,
-                    )
-                    .with_name(
-                        entry
-                            .get("display_name")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or(id),
-                    ),
-                );
+                let display = entry.get("display_name").and_then(|v| v.as_str());
+                models.push(anthropic_model_info(id, display));
             }
 
             after = next_page_params(
@@ -669,23 +686,7 @@ impl Provider for AnthropicProvider {
     }
 
     fn model(&self, model_id: &str) -> Result<Arc<dyn Model>, AiError> {
-        let info = ModelInfo::new(
-            ProviderId::new("anthropic"),
-            ModelId::new(model_id),
-            200_000,
-            64_000,
-        )
-        .with_name(model_id)
-        .with_capabilities(ModelCapabilities {
-            input_modalities: vec![ai_types::Modality::Text, ai_types::Modality::Image],
-            output_modalities: vec![ai_types::Modality::Text],
-            supports_streaming: true,
-            supports_tools: true,
-            supports_structured_output: false,
-            supports_embeddings: false,
-            supports_vision: true,
-            supports_fine_tuning: false,
-        });
+        let info = anthropic_model_info(model_id, None);
         Ok(Arc::new(AnthropicModel {
             provider: Arc::new(self.clone_for_model()),
             info,

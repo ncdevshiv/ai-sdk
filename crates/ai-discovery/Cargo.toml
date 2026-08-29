@@ -1,0 +1,32 @@
+[package]
+name = "ai-discovery"
+description = "Provider-agnostic model and capability discovery with full provenance"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+ai-errors = { path = "../ai-errors" }
+ai-types = { path = "../ai-types" }
+ai-models = { path = "../ai-models" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+regex = { workspace = true }
+url = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+clap = { workspace = true }

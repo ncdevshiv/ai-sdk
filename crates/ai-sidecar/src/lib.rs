@@ -552,6 +552,11 @@ impl Sidecar {
                     None => Ok(json!({ "cancelled": false })),
                 }
             }
+            "health" => Ok(json!({
+                "ok": true,
+                "protocol": PROTOCOL_VERSION,
+                "version": env!("CARGO_PKG_VERSION"),
+            })),
             other => Err(RpcError {
                 code: METHOD_NOT_FOUND,
                 message: format!("unknown method `{other}`"),
@@ -564,6 +569,24 @@ impl Sidecar {
         self.client.read().await.clone().ok_or_else(|| {
             RpcError::invalid_params("no client configured; send `configure` first".to_string())
         })
+    }
+
+    /// Graceful drain: wait for pumps to finish then abort leftovers.
+    /// Used by the supervisor during a quiesce before killing the old child.
+    pub fn drain_streams(&self, deadline_ms: u64) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(deadline_ms);
+        while std::time::Instant::now() < deadline {
+            let remaining = self
+                .streams
+                .lock()
+                .expect("streams lock not poisoned")
+                .len();
+            if remaining == 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        self.abort_all_streams();
     }
 
     fn abort_all_streams(&self) {

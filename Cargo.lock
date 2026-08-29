@@ -167,6 +167,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "ai-discovery"
+version = "0.1.0"
+dependencies = [
+ "ai-errors",
+ "ai-models",
+ "ai-types",
+ "async-trait",
+ "bytes",
+ "clap",
+ "futures",
+ "regex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "ai-edge"
 version = "0.1.0"
 dependencies = [
@@ -281,6 +302,7 @@ dependencies = [
  "ai-agents",
  "ai-config",
  "ai-core",
+ "ai-discovery",
  "ai-errors",
  "ai-memory",
  "ai-models",

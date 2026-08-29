@@ -31,6 +31,7 @@ no stubs, no placeholders).
 | [`ai-config`](crates/ai-config) | Unified configuration: env vars, TOML files, programmatic |
 | [`ai-errors`](crates/ai-errors) | Typed error hierarchy |
 | [`ai-models`](crates/ai-models) | Model registry, metadata, capabilities, routing |
+| [`ai-discovery`](crates/ai-discovery) | Provider-agnostic model/capability discovery with provenance (declared · inferred · probed) |
 | [`ai-providers`](crates/ai-providers) | Real adapters: OpenAI, Anthropic, Google Gemini, OpenRouter, Ollama |
 | [`ai-runtime`](crates/ai-runtime) | Parallel execution: concurrency limits, retries, circuit breaker |
 | [`ai-stream`](crates/ai-stream) | Unified streaming events, SSE parsing |
@@ -57,7 +58,7 @@ no stubs, no placeholders).
 
 ## Getting Started
 
-> **Status:** Implemented across 28 Rust crates — a 580+-test offline
+> **Status:** Implemented across 29 Rust crates — a 580+-test offline
 > suite (unit, proof, property, and integration tests) plus
 > credential-gated live suites. CI runs rustfmt, clippy (`-D warnings`),
 > and workspace tests; the live-gateway job runs only when its gateway
