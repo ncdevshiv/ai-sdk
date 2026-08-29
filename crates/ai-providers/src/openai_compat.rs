@@ -66,7 +66,7 @@ impl OpenAiCompatConfig {
             provider_id: provider_id.into(),
             api_key: api_key.into(),
             base_url: base_url.into(),
-            timeout: Duration::from_secs(30),
+            timeout: Duration::from_secs(90),
             extra_headers: Vec::new(),
         }
     }
@@ -112,21 +112,172 @@ impl std::fmt::Debug for OpenAiCompatProvider {
     }
 }
 
+/// Reads a concept from a `/v1/models` entry through the generic scanner
+/// (`ai_discovery::declared`): one synonym table shared by every crate,
+/// nested-path support (`capabilities.context_window`), numeric strings, and
+/// synonym-rank precedence.
+fn declared_u64(entry: &Value, concept: ai_discovery::declared::Concept) -> Option<u64> {
+    ai_discovery::declared::first_u64(entry, concept).map(|f| f.value)
+}
+
+/// Infers vision support from an entry's capability fields via the generic
+/// concept scanner.
+///
+/// Checks boolean `supports_vision`/`vision`/… (any of the synonym table's
+/// spellings, at any depth), feature lists for `vision`/`image` tokens, and
+/// input-modality arrays for image-like values. Returns `None` when the entry
+/// carries no vision signal.
+fn declared_vision(entry: &Value) -> Option<bool> {
+    use ai_discovery::declared::{Concept, all_strings, first_bool, has_feature};
+    if let Some(f) = first_bool(entry, Concept::Vision) {
+        return Some(f.value);
+    }
+    if let Some(f) = has_feature(entry, "vision").or_else(|| has_feature(entry, "image")) {
+        if f.value {
+            return Some(true);
+        }
+    }
+    if let Some((mods, _)) = all_strings(entry, Concept::InputModalities) {
+        let m = ai_discovery::modalities_from_strings(&mods);
+        let has_image = m.contains(&Modality::Image);
+        let has_text = m.contains(&Modality::Text);
+        if has_image || has_text {
+            return Some(has_image);
+        }
+    }
+    None
+}
+
+/// Builds a [`ModelInfo`] for an OpenAI-compatible `/v1/models` entry.
+///
+/// Priority: curated `default_catalog` for `provider:id` → response fields
+/// (`context_window`/`context_length`/… and `max_output_tokens`/…) → `0`
+/// sentinel for truly unknown limits (UI shows `—` rather than a fake
+/// `128k/8k`). Vision is `true` only when the catalog says so or the entry
+/// explicitly advertises image modality — never blanket `true`.
+fn model_info_from_entry(provider: &ProviderId, entry: &Value) -> Option<ModelInfo> {
+    let id = entry.get("id").and_then(|i| i.as_str())?;
+    // Name: prefer explicit display fields, fallback to id.
+    let name = entry
+        .get("display_name")
+        .or_else(|| entry.get("name"))
+        .or_else(|| entry.get("id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or(id)
+        .to_string();
+    if let Some(catalog_info) = ai_models::default_catalog().get(provider.as_str(), id) {
+        let mut info = catalog_info.clone();
+        // Override name with the gateway's label when it differs.
+        if name != id {
+            info.name = name;
+        }
+        // If the gateway advertises fresher limits, let them win. Parsed with
+        // the generic concept scanner (ai-discovery): synonym table, nested
+        // paths, rank precedence — not a hand-listed key set.
+        if let Some(ctx) = declared_u64(entry, ai_discovery::declared::Concept::ContextWindow) {
+            info.context_window = ctx;
+        }
+        if let Some(max_out) = declared_u64(entry, ai_discovery::declared::Concept::MaxOutputTokens)
+        {
+            info.max_output_tokens = max_out;
+        }
+        if let Some(vision) = declared_vision(entry) {
+            info.capabilities.supports_vision = vision;
+            if vision
+                && !info
+                    .capabilities
+                    .input_modalities
+                    .contains(&Modality::Image)
+            {
+                info.capabilities.input_modalities.push(Modality::Image);
+            }
+            if !vision {
+                info.capabilities
+                    .input_modalities
+                    .retain(|m| *m != Modality::Image);
+                if info.capabilities.input_modalities.is_empty() {
+                    info.capabilities.input_modalities.push(Modality::Text);
+                }
+            }
+        }
+        return Some(info);
+    }
+    // No catalog hit — parse limits from the entry or use 0 sentinel.
+    let context_window =
+        declared_u64(entry, ai_discovery::declared::Concept::ContextWindow).unwrap_or(0);
+    let max_output_tokens =
+        declared_u64(entry, ai_discovery::declared::Concept::MaxOutputTokens).unwrap_or(0);
+    let supports_vision = declared_vision(entry).unwrap_or(false);
+    let input_modalities = if supports_vision {
+        vec![Modality::Text, Modality::Image]
+    } else {
+        vec![Modality::Text]
+    };
+    Some(
+        ModelInfo::new(
+            provider.clone(),
+            ModelId::new(id),
+            context_window,
+            max_output_tokens,
+        )
+        .with_name(name)
+        .with_capabilities(ModelCapabilities {
+            input_modalities,
+            output_modalities: vec![Modality::Text],
+            // Zero evidence → zero claims. An unknown model must be
+            // probed (ai-discovery) before any capability is asserted;
+            // defaulting these to `true` reports capabilities the model
+            // does not have, which is worse than reporting none.
+            supports_streaming: false,
+            supports_tools: false,
+            supports_structured_output: false,
+            supports_embeddings: false,
+            supports_vision,
+            supports_fine_tuning: false,
+        }),
+    )
+}
+
+/// Like [`model_info_from_entry`] but for on-demand handles where no
+/// gateway JSON entry exists: consults the catalog only.
+fn model_info_for_id(provider: &ProviderId, model_id: &str) -> ModelInfo {
+    if let Some(catalog_info) = ai_models::default_catalog().get(provider.as_str(), model_id) {
+        return catalog_info.clone();
+    }
+    // Unknown model — no fake limits or blanket vision.
+    ModelInfo::new(provider.clone(), ModelId::new(model_id), 0, 0)
+        .with_name(model_id)
+        .with_capabilities(ModelCapabilities {
+            input_modalities: vec![Modality::Text],
+            output_modalities: vec![Modality::Text],
+            supports_streaming: true,
+            supports_tools: true,
+            supports_structured_output: false,
+            supports_embeddings: false,
+            supports_vision: false,
+            supports_fine_tuning: false,
+        })
+}
+
 impl OpenAiCompatProvider {
     pub fn new(config: OpenAiCompatConfig) -> Result<Self, AiError> {
         let http = HttpClient::shared();
         Ok(Self {
             config,
             http,
+            // Generic fallback for direct `model()` handles; per-model
+            // `list_models` derives capabilities from catalog/entry, not
+            // this blanket value. Text-only is the conservative default —
+            // vision is claimed only when the catalog or entry warrants it.
             capabilities: ModelCapabilities {
-                input_modalities: vec![Modality::Text, Modality::Image],
+                input_modalities: vec![Modality::Text],
                 output_modalities: vec![Modality::Text],
                 supports_streaming: true,
                 supports_tools: true,
-                supports_structured_output: true,
-                supports_embeddings: true,
-                supports_vision: true,
-                supports_fine_tuning: true,
+                supports_structured_output: false,
+                supports_embeddings: false,
+                supports_vision: false,
+                supports_fine_tuning: false,
             },
         })
     }
@@ -675,7 +826,17 @@ fn build_chat_body(request: &ChatRequest, model: &str, stream: bool) -> Result<V
         body["stop"] = json!(request.stop);
     }
     if let Some(reasoning_effort) = request.reasoning_effort {
-        body["reasoning_effort"] = json!(reasoning_effort.to_string());
+        // Upstream gateways (e.g. opencode/ncnio zen at 127.0.0.1:5664)
+        // reject `max` with `unknown variant 'max', expected one of
+        // 'low','medium','high'` — normalize Max→High rather than error,
+        // preserving the \"extra thinking\" intent within the provider's
+        // known range. Max is still advertised in the Models UI; the
+        // normalization is a wire-level tolerance.
+        let wire_effort = match reasoning_effort {
+            ai_core::ReasoningEffort::Max => ai_core::ReasoningEffort::High,
+            other => other,
+        };
+        body["reasoning_effort"] = json!(wire_effort.to_string());
     }
     if let Some(seed) = request.seed {
         body["seed"] = json!(seed);
@@ -995,26 +1156,13 @@ impl Provider for OpenAiCompatProvider {
         let provider = ProviderId::new(self.config.provider_id.clone());
         Ok(data
             .iter()
-            .filter_map(|m| {
-                let id = m.get("id").and_then(|i| i.as_str())?;
-                Some(
-                    ModelInfo::new(provider.clone(), ModelId::new(id), 128_000, 8_192)
-                        .with_name(id)
-                        .with_capabilities(self.capabilities.clone()),
-                )
-            })
+            .filter_map(|m| model_info_from_entry(&provider, m))
             .collect())
     }
 
     fn model(&self, model_id: &str) -> Result<Arc<dyn Model>, AiError> {
-        let info = ModelInfo::new(
-            ProviderId::new(self.config.provider_id.clone()),
-            ModelId::new(model_id),
-            128_000,
-            8_192,
-        )
-        .with_name(model_id)
-        .with_capabilities(self.capabilities.clone());
+        let provider = ProviderId::new(self.config.provider_id.clone());
+        let info = model_info_for_id(&provider, model_id);
         Ok(Arc::new(OpenAiCompatModel::new(
             Arc::new(self.clone_for_model()),
             info,

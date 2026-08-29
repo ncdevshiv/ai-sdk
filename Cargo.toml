@@ -6,6 +6,7 @@ members = [
     "crates/ai-config",
     "crates/ai-errors",
     "crates/ai-models",
+    "crates/ai-discovery",
     "crates/ai-providers",
     "crates/ai-runtime",
     "crates/ai-stream",

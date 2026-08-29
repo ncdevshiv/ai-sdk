@@ -453,6 +453,24 @@ fn model_from_entry(entry: &Value) -> Option<ModelInfo> {
         .get("outputTokenLimit")
         .and_then(|v| v.as_u64())
         .unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS);
+    // Vision: only claim Image when the entry advertises it — otherwise
+    // text-only is the conservative truth (no hardcoded blanket Image).
+    let supports_vision = entry
+        .get("supportedActions")
+        .and_then(|v| v.as_array())
+        .is_some_and(|arr| {
+            arr.iter().any(|v| {
+                v.as_str().is_some_and(|s| {
+                    s.to_ascii_lowercase().contains("image")
+                        || s.to_ascii_lowercase().contains("vision")
+                })
+            })
+        });
+    let input_modalities = if supports_vision {
+        vec![ai_types::Modality::Text, ai_types::Modality::Image]
+    } else {
+        vec![ai_types::Modality::Text]
+    };
     Some(
         ModelInfo::new(
             ProviderId::new("google"),
@@ -462,13 +480,13 @@ fn model_from_entry(entry: &Value) -> Option<ModelInfo> {
         )
         .with_name(id)
         .with_capabilities(ModelCapabilities {
-            input_modalities: vec![ai_types::Modality::Text, ai_types::Modality::Image],
+            input_modalities,
             output_modalities: vec![ai_types::Modality::Text],
             supports_streaming: has_method("streamGenerateContent"),
             supports_tools: has_method("generateContent"),
             supports_structured_output: false,
             supports_embeddings: has_method("embedContent") || has_method("embedText"),
-            supports_vision: false,
+            supports_vision,
             supports_fine_tuning: false,
         }),
     )

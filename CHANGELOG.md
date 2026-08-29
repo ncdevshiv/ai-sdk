@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+Universal model discovery — 2026-08-29 (`ai-discovery` crate, NEW; validated
+live against b.ai, NVIDIA and SenseNova — 133 models):
+
+- Provider-agnostic discovery engine with three evidence layers, each fact
+  carrying its [`provenance`](crates/ai-discovery/src/provenance.rs):
+  **declared** (recursive synonym-scanner over `/v1/models` JSON, no provider
+  names in code), **inferred** (limits mined from rejection text, e.g. `[1,
+  65536]`), **probed** (real requests against the gateway). When a probe
+  contradicts a declaration the probe wins and the conflict is recorded as an
+  `anomalies` entry — wrong capabilities are traceable, not invisible
+- `ai-models`: `ModelInfo.thinking_control` — the measured per-model spelling
+  that disables thinking (differs between models on the same provider), plus
+  a curated `default_catalog` registry that discovery anchors to
+- `ai-core`: `ReasoningEffort::Max` variant
+- `ai-providers`: catalog-aware `ModelInfo` in `anthropic` / `gemini` /
+  `openai_compat` — the hardcoded fake `128k/8k` limits are gone (unknown
+  models report `0` sentinels, the UI shows `—` instead of a lie); gemini
+  vision is now inferred from `supportedActions` instead of blanket `true`;
+  `reasoning_effort=max` is normalized to `high` on the wire for gateways
+  that reject `max`; default timeout 30s → 90s
+- `ai-sidecar`: `health` RPC (`ok`/`protocol`/`version`) and
+  `drain_streams(deadline_ms)` for supervisor quiesce
+
 Sidecar JSON-RPC gateway — 2026-08-26 (`ai-sidecar` crate, NEW):
 
 - stdio NDJSON gateway exposing the SDK to non-Rust hosts:
