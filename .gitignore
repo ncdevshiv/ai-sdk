@@ -53,3 +53,9 @@ temp/
 *.sqlite
 *.sqlite3
 *.db
+
+# Local probe/lab scripts — carry plaintext live credentials, never commit
+tools/
+
+# Agent workspace memory
+.workbuddy-ai/
