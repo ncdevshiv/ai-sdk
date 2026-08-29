@@ -37,3 +37,19 @@ coverage/
 # Temporary files
 tmp/
 temp/
+
+# Rust build artifacts
+/target
+**/*.rs.bk
+
+# Secrets — never commit credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Local databases / caches
+*.sqlite
+*.sqlite3
+*.db
